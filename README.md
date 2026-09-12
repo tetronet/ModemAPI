@@ -48,6 +48,9 @@ modem.AttachReceiveEvent(delegate (DataBlock remoteMessage, Action obsolete)
 });
 ```
 
+### Important
+Tetronet doesn't deliver packets 100% of the time, use the `SRTPClient` to prevent packet loss and reordering.
+
 ### Things you'll need to do
 1) Install doghappy's SocketIOClient library
 2) Install System.IO.Ports library
@@ -56,9 +59,9 @@ modem.AttachReceiveEvent(delegate (DataBlock remoteMessage, Action obsolete)
 5) Have fun! Tetronet is made for people, not for asking for your wallet!
 
 Cmds:
-dotnet add package SocketIOClient
-dotnet add package System.IO.Ports
-dotnet add package System.IO.Hashing
+`dotnet add package SocketIOClient`
+`dotnet add package System.IO.Ports`
+`dotnet add package System.IO.Hashing`
 
 ### Supporting the project
 I don't know for to use donation services, just have fun and this will support me. Build you tetronet-compatible infrastructure, develop protocols, servers, clients, web-browsers, terminals, remote desktops and other stuff, I'm gonna appreciate that.
