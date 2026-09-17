@@ -44,7 +44,7 @@ namespace ModemAPI
             }
             packet.Receiver = new(string.Join("-", receiverAddressList.ToArray()));
             packet.Transmitter = new(string.Join("-", transmitterAddressList.ToArray()));
-            packet.DataBytes = Convert.FromBase64String(message.package_data).ToList();
+            packet.DataBytes = [.. Convert.FromBase64String(message.package_data)];
             packet.Metadata = message.metadata;
             packet.PacketNo = (byte)message.package_info.package_no;
             packet.MessageId = (ulong)message.package_info.message_id;
@@ -159,7 +159,7 @@ namespace ModemAPI
                 {
                     return Packet.Static.ErroredPacket;
                 }
-                List<byte> packetDataBytes_ = [.. packetData];
+                byte[] packetDataBytes_ = [.. packetData];
                 string packetMetadata_ = Encoding.ASCII.GetString(packetMetadata);
                 foreach (char c in packetMetadata_)
                 {
@@ -235,11 +235,11 @@ namespace ModemAPI
             buffer.AddRange(mid);
 
             // Data
-            if (packet.DataBytes.Count > ushort.MaxValue)
+            if (packet.DataBytes.Length > ushort.MaxValue)
                 throw new ArgumentOutOfRangeException(nameof(packet), "packet data too large");
 
             Span<byte> dataLengthBytes = stackalloc byte[2];
-            BinaryPrimitives.WriteUInt16BigEndian(dataLengthBytes, (ushort)packet.DataBytes.Count);
+            BinaryPrimitives.WriteUInt16BigEndian(dataLengthBytes, (ushort)packet.DataBytes.Length);
             buffer.AddRange(dataLengthBytes);
             buffer.AddRange(packet.DataBytes);
 

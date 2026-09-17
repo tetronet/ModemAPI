@@ -48,9 +48,6 @@ modem.AttachReceiveEvent(delegate (DataBlock remoteMessage, Action obsolete)
 });
 ```
 
-### Important
-Tetronet doesn't deliver packets 100% of the time, use the `SRTPClient` to prevent packet loss and reordering. If you need to send a message like qt=message cid=22384112, you don't need it, but if you want to send files, use `LMDTPServer` and `LMDTPClient`, or stream it manually using `SRTPClient`. Probability of 1 packet getting lost if the network isn't overloaded is low, if once you have a giant videofile, or a teletype stream, it's very recommended to use `SRTPClient`. It's a bit harder to setup, than just making `modem.Transmit(data, dest, qt, cid)`, but it will give you a reliability layer. `SRTPClient` is used in multiple of my projects, so you could trust it.
-
 ### Things you'll need to do
 1) Install doghappy's SocketIOClient library
 2) Install System.IO.Ports library
@@ -59,9 +56,9 @@ Tetronet doesn't deliver packets 100% of the time, use the `SRTPClient` to preve
 5) Have fun! Tetronet is made for people, not for asking for your wallet!
 
 Cmds:
-`dotnet add package SocketIOClient`
-`dotnet add package System.IO.Ports`
-`dotnet add package System.IO.Hashing`
+dotnet add package SocketIOClient
+dotnet add package System.IO.Ports
+dotnet add package System.IO.Hashing
 
 ### Supporting the project
 I don't know for to use donation services, just have fun and this will support me. Build you tetronet-compatible infrastructure, develop protocols, servers, clients, web-browsers, terminals, remote desktops and other stuff, I'm gonna appreciate that.

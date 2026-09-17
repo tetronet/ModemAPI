@@ -11,7 +11,7 @@
         }
         public Packet(Address tx,
             Address rx,
-            List<byte> bytes,
+            byte[] bytes,
             bool last,
             string? md,
             string qt,
@@ -20,7 +20,15 @@
             ulong pid,
             ulong mid)
         {
-            
+            Receiver = rx;
+            Transmitter = tx;
+            IsLastInSequence = last;
+            Metadata = md;
+            QueryType = qt;
+            ConnectionID = cid;
+            IsErrorWhileReading = errored;
+            PacketNo = pid;
+            MessageId = mid;
         }
         /// <summary>
         /// TetroNet subscriber address, that transmitted this instance of packet.
@@ -33,7 +41,7 @@
         /// <summary>
         /// Data of the packet, that was transferred in it.
         /// </summary>
-        public List<byte> DataBytes = new List<byte>();
+        public byte[] DataBytes = [];
         /// <summary>
         /// Is packet last in packet sequence.
         /// </summary>
@@ -72,7 +80,7 @@
             /// <summary>
             /// Represents a packet, that had one or more errors to occur during receiving process.
             /// </summary>
-            public static readonly Packet ErroredPacket = new(new(), new(), new(), false, null, "", 0, true, 0, 0);
+            public static readonly Packet ErroredPacket = new(new(), new(), [], false, null, "", 0, true, 0, 0);
         }
     }
 }

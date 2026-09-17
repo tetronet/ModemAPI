@@ -326,7 +326,7 @@ namespace ModemAPI
             for (int i = 0; i < data.Length; i += packetSize)
             {
                 Packet packet = new();
-                packet.DataBytes = data.Skip(i).Take(packetSize).ToList();
+                packet.DataBytes = [.. data.Skip(i).Take(packetSize)];
                 packet.QueryType = queryType;
                 packet.ConnectionID = connectionId;
                 packet.Metadata = metadata;
@@ -350,7 +350,7 @@ namespace ModemAPI
             for (int i = 0; i < data.Length; i += packetSize)
             {
                 Packet packet = new();
-                packet.DataBytes = Encoding.UTF8.GetBytes(new string((char[])data.ToCharArray().Skip(i).Take(packetSize)).ToArray()).ToList();
+                packet.DataBytes = Encoding.UTF8.GetBytes(new string((char[])data.ToCharArray().Skip(i).Take(packetSize)).ToArray()).ToArray();
                 packet.QueryType = queryType;
                 packet.ConnectionID = connectionId;
                 packet.Metadata = metadata;
