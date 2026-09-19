@@ -48,6 +48,10 @@ namespace ModemAPI
         /// </summary>
         public Action<long> OnOutOfOrderPacketReceived = delegate { };
         /// <summary>
+        /// How many packets can stand in the send, but unacked state.
+        /// </summary>
+        public int MaxUnackedPackets = 10000;
+        /// <summary>
         /// Delay in Ticks (each tick is 100 ns) between Universal Packet Sends.
         /// </summary>
         public int TicksPacketDelay = 0;
@@ -159,6 +163,10 @@ namespace ModemAPI
             if (data.Length > 59992 || data.Length == 0)
             {
                 throw new ArgumentOutOfRangeException(nameof(data), "data must contain not more than 59992 bytes and not less than 1 byte");
+            }
+            while (InternalState.Count > MaxUnackedPackets)
+            {
+                Thread.Sleep(1);
             }
             byte[] data_ = new byte[data.Length + 8];
             BinaryPrimitives.WriteInt64BigEndian(data_.AsSpan(), SequentialPacketNumber);

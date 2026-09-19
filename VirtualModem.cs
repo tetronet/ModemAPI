@@ -2,15 +2,20 @@
 using System.Text;
 using System.IO.Ports;
 using System.IO.Hashing;
+using System.Net.WebSockets;
+using System.Buffers;
+using System.Text.Json;
 
 namespace ModemAPI
 {
     public class VirtualModem : IModem, IAnswerHost
     {
+        private string Cias = "";
         private string UploadLargeMessagesTo = "";
         private string DownloadLargeMessagesFrom = "";
         private string DeleteLargeMessages = "";
-        private SocketIOClient.SocketIO? TransmitterDevice = null;
+        private SocketIO? TransmitterDevice = null;
+        private ClientWebSocket? RawTransmitterDevice = null;
         private object PacketBufferLock = new object();
         private SortedDictionary<ulong, SortedDictionary<ulong, Packet>> PacketBuffer = new SortedDictionary<ulong, SortedDictionary<ulong, Packet>>();
         private byte[]? MessageBufferBytes = null;
@@ -22,6 +27,7 @@ namespace ModemAPI
         private bool AddressWasSetByUpperNode = false; // SMLA or not
         private bool IsProcessingMessage = false; // Flag to prevent working on the same packet more than 1 time.
         private bool InternalModemConnected = false;
+        private bool WebSocketOrSocketIO = false; // false if socket.io, true if websocket
         internal List<string> TakenNumbers = []; // Address Values, that were already taken by the Slave Modems
         public LargeMessage? LastDownloadedLargeMessage { get; set; }
         public bool IsModemConnected { get { return InternalModemConnected && LocalModemAddress != null && !LocalModemAddress.IsEmpty; } }
@@ -58,16 +64,23 @@ namespace ModemAPI
         /// <param name="uploadLmsTo">Used to upload Large Messages to the tetronet</param>
         /// <param name="downloadLmsFrom">Used to get Large Messages from the tetronet</param>
         /// <param name="deleteLmsApi">Used to delete Large Messages from the tetronet</param>
-        public VirtualModem(string domain, LineParams innerLineParams, string uploadLmsTo = "", string downloadLmsFrom = "", string deleteLmsApi = "")
+        public VirtualModem(string domain, LineParams innerLineParams, string uploadLmsTo = "", string downloadLmsFrom = "", string deleteLmsApi = "", bool rawWs = false)
         {
             LocalModemAddress = innerLineParams.ModemLocalAddress;
-
-            TransmitterDevice = new SocketIO(new(domain), new SocketIOOptions());
-
+            if (!rawWs)
+            {
+                TransmitterDevice = new SocketIO(new(domain), new SocketIOOptions());
+            }
+            else
+            {
+                RawTransmitterDevice = new ClientWebSocket();
+            }
+            WebSocketOrSocketIO = rawWs;
             UploadLargeMessagesTo = uploadLmsTo;
             DownloadLargeMessagesFrom = downloadLmsFrom;
             DeleteLargeMessages = deleteLmsApi;
             SlaveLargeMessageExchangeDirectory = "";
+            Cias = domain;
         }
         /// <summary>
         /// Attach an event when packet queue is received from the tetronet.
@@ -398,82 +411,200 @@ namespace ModemAPI
         /// <exception cref="NullReferenceException">Happens when something goes extremely wrong, and SocketIO client is NULL</exception>
         public void Dial()
         {
-            if (TransmitterDevice == null)
+            if (!WebSocketOrSocketIO)
             {
-                throw new NullReferenceException("there are no transmitter device in this modem");
-            }
-            string localModemAddressString = "";
-            if (LocalModemAddress == null || LocalModemAddress.AddressValue == null)
-            {
-                localModemAddressString = "0";
+                if (TransmitterDevice == null)
+                {
+                    throw new NullReferenceException("there are no transmitter device in this modem");
+                }
+                string localModemAddressString = "";
+                if (LocalModemAddress == null || LocalModemAddress.AddressValue == null)
+                {
+                    localModemAddressString = "0";
+                }
+                else
+                {
+                    localModemAddressString = LocalModemAddress.AddressValue;
+                }
+                TransmitterDevice.On("get-addr", async delegate (IEventContext context)
+                {
+                    await TransmitterDevice.EmitAsync("self-addr", [localModemAddressString]);
+                    return;
+                });
+                TransmitterDevice.On("set-modem-local-address", delegate (IEventContext dto)
+                {
+                    string[]? data = dto.GetValue<string[]>(0);
+                    if (data == null)
+                    {
+                        throw new ConnectionFailedException();
+                    }
+                    localModemAddressString = string.Join("-", data);
+                    LocalModemAddress = new Address(localModemAddressString);
+                    AddressWasSetByUpperNode = true;
+                    return Task.CompletedTask;
+                });
+                TransmitterDevice.On("addr-ok", delegate (IEventContext dto)
+                {
+                    AddressWasSetByUpperNode = false;
+                    return Task.CompletedTask;
+                });
+                TransmitterDevice.On("get-device-type", async delegate (IEventContext dto)
+                {
+                    await TransmitterDevice.EmitAsync("device-type", [ConnectAsAnAddressMachine ? "address-machine" : "modem"]);
+                    InternalModemConnected = true;
+                    return;
+                });
+                TransmitterDevice.On("data-transmission", async delegate (IEventContext dto)
+                {
+                    ModemAPIDebugger.OutputDebugMessage("virtmodem received packet");
+                    if (LocalModemAddress == null || LocalModemAddress.AddressValue == null)
+                    {
+                        throw new NullAddressException("address not exist");
+                    }
+                    WebSocketMessage? receivedMessage = dto.GetValue<WebSocketMessage>(0);
+                    if (receivedMessage == null)
+                    {
+                        return;
+                    }
+                    Packet receivedPacket = PacketConverter.WebSocketMessageToPacket(receivedMessage);
+                    ModemAPIDebugger.OutputDebugMessage(receivedPacket.Receiver.AddressValue ?? "virtmodem no receiver");
+                    ModemAPIDebugger.OutputDebugMessage(receivedPacket.Transmitter.AddressValue ?? "virtmodem no transmitter");
+                    if (receivedPacket.IsErrorWhileReading == true)
+                    {
+                        ModemAPIDebugger.OutputDebugMessage("error while receiving packet");
+                        return;
+                    }
+                    string? receiverAddress = receivedPacket.Receiver.AddressValue;
+                    string? transmitterAddress = receivedPacket.Transmitter.AddressValue;
+                    if (receiverAddress == null || transmitterAddress == null)
+                    {
+                        //Console.WriteLine("tx or rx null");
+                        return;
+                    }
+                    if (receiverAddress.StartsWith(LocalModemAddress.AddressValue) && !transmitterAddress.StartsWith(LocalModemAddress.AddressValue))
+                    {
+                        //Console.WriteLine("actually working");
+                        InternalPacketEvents(receivedPacket, delegate () { throw new NotImplementedException("was unable to remove the event"); });
+                        GenericPacketCounter++;
+                    }
+                });
+                TransmitterDevice.ConnectAsync();
             }
             else
             {
-                localModemAddressString = LocalModemAddress.AddressValue;
-            }
-            TransmitterDevice.On("get-addr", async delegate (IEventContext context)
-            {
-                await TransmitterDevice.EmitAsync("self-addr", [localModemAddressString]);
-                return;
-            });
-            TransmitterDevice.On("set-modem-local-address", delegate (IEventContext dto)
-            {
-                string[]? data = dto.GetValue<string[]>(0);
-                if (data == null)
+                if (RawTransmitterDevice == null)
                 {
-                    throw new ConnectionFailedException();
+                    throw new NullReferenceException("there are no transmitter device in this modem");
                 }
-                localModemAddressString = string.Join("-", data);
-                LocalModemAddress = new Address(localModemAddressString);
-                AddressWasSetByUpperNode = true;
-                return Task.CompletedTask;
-            });
-            TransmitterDevice.On("addr-ok", delegate (IEventContext dto)
-            {
-                AddressWasSetByUpperNode = false;
-                return Task.CompletedTask;
-            });
-            TransmitterDevice.On("get-device-type", async delegate (IEventContext dto)
-            {
-                await TransmitterDevice.EmitAsync("device-type", [ConnectAsAnAddressMachine ? "address-machine" : "modem"]);
-                InternalModemConnected = true;
-                return;
-            });
-            TransmitterDevice.On("data-transmission", async delegate (IEventContext dto)
-            {
-                ModemAPIDebugger.OutputDebugMessage("virtmodem received packet");
+                string localModemAddressString = "";
                 if (LocalModemAddress == null || LocalModemAddress.AddressValue == null)
                 {
-                    throw new NullAddressException("address not exist");
+                    localModemAddressString = "0";
                 }
-                WebSocketMessage? receivedMessage = dto.GetValue<WebSocketMessage>(0);
-                if (receivedMessage == null)
+                else
                 {
-                    return;
+                    localModemAddressString = LocalModemAddress.AddressValue;
                 }
-                Packet receivedPacket = PacketConverter.WebSocketMessageToPacket(receivedMessage);
-                ModemAPIDebugger.OutputDebugMessage(receivedPacket.Receiver.AddressValue ?? "virtmodem no receiver");
-                ModemAPIDebugger.OutputDebugMessage(receivedPacket.Transmitter.AddressValue ?? "virtmodem no transmitter");
-                if (receivedPacket.IsErrorWhileReading == true)
+                Task.Run(async delegate ()
                 {
-                    ModemAPIDebugger.OutputDebugMessage("error while receiving packet");
-                    return;
-                }
-                string? receiverAddress = receivedPacket.Receiver.AddressValue;
-                string? transmitterAddress = receivedPacket.Transmitter.AddressValue;
-                if (receiverAddress == null || transmitterAddress == null)
-                {
-                    //Console.WriteLine("tx or rx null");
-                    return;
-                }
-                if (receiverAddress.StartsWith(LocalModemAddress.AddressValue) && !transmitterAddress.StartsWith(LocalModemAddress.AddressValue))
-                {
-                    //Console.WriteLine("actually working");
-                    InternalPacketEvents(receivedPacket, delegate () { throw new NotImplementedException("was unable to remove the event"); });
-                    GenericPacketCounter++;
-                }
-            });
-            TransmitterDevice.ConnectAsync();
+                    try
+                    {
+                        await RawTransmitterDevice.ConnectAsync(new Uri(Cias), default);
+                    }
+                    catch
+                    {
+                        await ReconnectAsync();
+                    }
+                    byte[] webSocketReceiveBuffer = new byte[500000];
+                    while (true)
+                    {
+                        try
+                        {
+                            WebSocketReceiveResult rslt;
+                            try
+                            {
+                                rslt = await RawTransmitterDevice.ReceiveAsync(webSocketReceiveBuffer, default);
+                            }
+                            catch
+                            {
+                                await ReconnectAsync();
+                                continue;
+                            }
+                            if (rslt.MessageType == WebSocketMessageType.Close) // connection closed
+                            {
+                                await ReconnectAsync();
+                                continue;
+                            }
+                            Span<byte> message = webSocketReceiveBuffer.AsSpan(0, rslt.Count);
+                            string textMessage = Encoding.ASCII.GetString(message);
+                            int eventNameStart = textMessage.IndexOf('"');
+                            int eventNameEnd = textMessage.IndexOf('"', eventNameStart + 1);
+                            string eventName = textMessage[(eventNameStart + 1)..eventNameEnd].Trim();
+                            ModemAPIDebugger.OutputDebugMessage("RECEIVED EVENT!!! " + eventName);
+                            switch (eventName)
+                            {
+                                case "get-addr":
+                                    await RawTransmitterDevice.SendAsync(Encoding.ASCII.GetBytes($"[\"self-addr\",\"{localModemAddressString}\"]"), WebSocketMessageType.Text, true, default);
+                                    break;
+                                case "set-modem-local-address":
+                                    List<JsonElement>? stringsSmla = JsonSerializer.Deserialize<List<JsonElement>>(textMessage) ?? throw new ConnectionFailedException("during SMLA there was no JSON data");
+                                    string[]? data = stringsSmla[1].Deserialize<string[]>() ?? throw new ConnectionFailedException();
+                                    localModemAddressString = string.Join("-", data);
+                                    LocalModemAddress = new Address(localModemAddressString);
+                                    AddressWasSetByUpperNode = true;
+                                    break;
+                                case "addr-ok":
+                                    AddressWasSetByUpperNode = false;
+                                    break;
+                                case "get-device-type":
+                                    await RawTransmitterDevice.SendAsync(Encoding.ASCII.GetBytes($"[\"device-type\",\"{(ConnectAsAnAddressMachine ? "address-machine" : "modem")}\"]"), WebSocketMessageType.Text, true, default);
+                                    InternalModemConnected = true;
+                                    break;
+                                case "data-transmission":
+                                    ModemAPIDebugger.OutputDebugMessage("virtmodem received packet");
+                                    if (LocalModemAddress == null || LocalModemAddress.AddressValue == null)
+                                    {
+                                        break;
+                                    }
+                                    List<JsonElement>? temp = JsonSerializer.Deserialize<List<JsonElement>>(textMessage);
+                                    if (temp == null) break;
+
+                                    WebSocketMessage? receivedMessage = temp[1].Deserialize<WebSocketMessage>();
+                                    if (receivedMessage == null)
+                                    {
+                                        break;
+                                    }
+                                    Packet receivedPacket = PacketConverter.WebSocketMessageToPacket(receivedMessage);
+                                    ModemAPIDebugger.OutputDebugMessage(receivedPacket.Receiver.AddressValue ?? "virtmodem no receiver");
+                                    ModemAPIDebugger.OutputDebugMessage(receivedPacket.Transmitter.AddressValue ?? "virtmodem no transmitter");
+                                    if (receivedPacket.IsErrorWhileReading == true)
+                                    {
+                                        ModemAPIDebugger.OutputDebugMessage("error while receiving packet");
+                                        break;
+                                    }
+                                    string? receiverAddress = receivedPacket.Receiver.AddressValue;
+                                    string? transmitterAddress = receivedPacket.Transmitter.AddressValue;
+                                    if (receiverAddress == null || transmitterAddress == null)
+                                    {
+                                        //Console.WriteLine("tx or rx null");
+                                        break;
+                                    }
+                                    if (receiverAddress.StartsWith(LocalModemAddress.AddressValue) && !transmitterAddress.StartsWith(LocalModemAddress.AddressValue))
+                                    {
+                                        //Console.WriteLine("actually working");
+                                        InternalPacketEvents(receivedPacket, delegate () { throw new NotImplementedException("was unable to remove the event"); });
+                                        GenericPacketCounter++;
+                                    }
+                                    break;
+                            }
+                        }
+                        catch
+                        {
+                            await Task.Delay(100);
+                        }
+                    }
+                });
+            }
         }
         /// <summary>
         /// Disconnects this modem from the tetronet.
@@ -596,16 +727,26 @@ namespace ModemAPI
         /// Inner-method for transmitting a single packet to the tetronet.
         /// </summary>
         /// <param name="packet">Packet for transmitting</param>
-        /// <exception cref="NullReferenceException">When something goes wrong</exception>
-        internal void Transmit(Packet packet)
+        /// <exception cref="InvalidOperationException">When something goes wrong</exception>
+        internal async void Transmit(Packet packet)
         {
-            if (TransmitterDevice == null)
+            if (!WebSocketOrSocketIO)
             {
-                throw new NullReferenceException("transmitter device null");
+                if (TransmitterDevice == null)
+                {
+                    throw new InvalidOperationException("transmitter device null");
+                }
+                await TransmitterDevice.EmitAsync("data-transmission", [PacketConverter.PacketToWebSocketMessage(packet)]);
             }
-            //Console.WriteLine($"Transmitting packet {packet.PacketNo}, data: '{packet.DataString}', IsLast: {packet.IsLastInSequence}");
-            //ModemAPIDebugger.PrintOutPacket(packet);
-            TransmitterDevice.EmitAsync("data-transmission", [PacketConverter.PacketToWebSocketMessage(packet)]).Wait();
+            else
+            {
+                if (RawTransmitterDevice == null)
+                {
+                    throw new InvalidOperationException("transmitter device null");
+                }
+                byte[] payload = JsonSerializer.SerializeToUtf8Bytes(new object[] { "data-transmission", PacketConverter.PacketToWebSocketMessage(packet) });
+                await RawTransmitterDevice.SendAsync(payload, WebSocketMessageType.Text, true, default);
+            }
             GenericPacketCounter++;
         }
         /// <summary>
@@ -618,16 +759,7 @@ namespace ModemAPI
         /// <exception cref="NotImplementedException">idk how to implement that</exception>
         internal void InternalAttachReceiveEvent(Action<Packet, Action> onReceive)
         {
-            if (TransmitterDevice == null)
-            {
-                throw new NullReferenceException("no transmitter found");
-            }
-            if (!TransmitterDevice.Connected)
-            {
-                throw new ModemNotConnectedException("modem must be connected to add incoming message events");
-            }
             InternalPacketEvents += onReceive;
-            //Console.WriteLine("InternalAttachReceiveEvent invoked!!");
         }
         /// <summary>
         /// Forces a Large Message to be uploaded to the tetronet.
@@ -847,6 +979,23 @@ namespace ModemAPI
             TakenNumbers.Add(number);
             AddressPortPairs.TryAdd(result.ToString(), modemName);
             return result;
+        }
+        private async Task ReconnectAsync()
+        {
+            InternalModemConnected = false;
+            while (true)
+            {
+                try
+                {
+                    RawTransmitterDevice = new ClientWebSocket();
+                    await RawTransmitterDevice.ConnectAsync(new Uri(Cias), default);
+                    return;
+                }
+                catch
+                {
+                    await Task.Delay(2000);
+                }
+            }
         }
 
         public void AttachPacketRouter(IPacketRouter router)
