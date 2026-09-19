@@ -56,14 +56,21 @@ modem.AttachReceiveEvent(delegate (DataBlock remoteMessage, Action obsolete)
 5) Have fun! Tetronet is made for people, not for asking for your wallet!
 
 Cmds:
+```
 dotnet add package SocketIOClient
 dotnet add package System.IO.Ports
 dotnet add package System.IO.Hashing
+```
+
+### CIASes
+You can create your own, or use one of mine:
+- `wss://data-set.su:3000/` - is for Socket.IO connections
+- `ws://data-set.su:30000/` - is for Raw websocket connections
 
 ### Supporting the project
 I don't know for to use donation services, just have fun and this will support me. Build you tetronet-compatible infrastructure, develop protocols, servers, clients, web-browsers, terminals, remote desktops and other stuff, I'm gonna appreciate that.
 Basically just have fun. I'm not gonna ask you for anything. I'm new on github, so don't judge me for my codestyle, or README, I made it in like a few minutes xd
-You could use my tetronet server, wss://data-set.su:3000/, but soon I'm gonna open-source it, so all of us will be able to make tetronet a real network with thousands or even a hundred thousand computers.
+You could use my tetronet server, wss://data-set.su:3000/, but soon I'm gonna open-source it, so all of us will be able to make tetronet a real network with thousands or even hundreds of thousands of computers.
 
 ### P.s.
 Guys, look though other of my projects, they're free and open source cause I don't need money. I need a program used by a lot of people. I don't want to earn billion dollars, I want so you will appreciate my work. I'm spending weeks or sometimes even months on the development and don't ask you any subscription or "premium" features. It's all free.
