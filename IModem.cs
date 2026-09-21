@@ -13,6 +13,7 @@
         void Drop(bool carefulMode);
         void Transmit(byte[] data, Address address, string queryType, uint connectionId, string? metadata = null, ushort packetSize = 1024, int delay = 0);
         void Transmit(string data, Address address, string queryType, uint connectionId, string? metadata = null, ushort packetSize = 1024, int delay = 0);
+        void LowLevelTransmit(byte[] data, Address address, string queryType, uint connectionId, string? metadata = null);
         void AttachReceiveEvent(Action<DataBlock, Action> onReceive);
         void AttachReceiveEventNoUnfragment(Action<Packet, Action> onReceive);
         bool IsAddressSMLA();

@@ -1020,5 +1020,10 @@ namespace ModemAPI
         {
             throw new NotImplementedException();
         }
+
+        public void LowLevelTransmit(byte[] data, Address address, string queryType, uint connectionId, string? metadata = null)
+        {
+            throw new NotImplementedException();
+        }
     }
 }

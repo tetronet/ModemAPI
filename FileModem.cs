@@ -80,7 +80,10 @@ namespace ModemAPI {
             }
             TryFlushBufferToCarry();
         }
-
+        public void LowLevelTransmit(byte[] data, Address address, string qt, uint cid, string? metadata)
+        {
+            throw new NotImplementedException();
+        }
         public void Transmit(string data, Address address, string queryType, uint connectionId, string? metadata = null, ushort packetSize = 1024, int delay = 100)
         {
             string ts = DateTime.UtcNow.ToString("yyyyMMdd_HHmmssfff");

@@ -468,6 +468,25 @@ namespace ModemAPI
             }
         }
 
+        public void LowLevelTransmit(byte[] data, Address address, string qt, uint cid, string? metadata)
+        {
+            if (LocalModemAddress == null)
+            {
+                throw new NullAddressException();
+            }
+            Packet packet = new();
+            packet.PacketNo = 0;
+            packet.MessageId = (ulong)Random.Shared.NextInt64();
+            packet.Transmitter = LocalModemAddress;
+            packet.QueryType = qt;
+            packet.Receiver = address;
+            packet.ConnectionID = cid;
+            packet.Metadata = metadata;
+            packet.DataBytes = data;
+            packet.IsLastInSequence = true;
+            Transmit(packet);
+        }
+
         /// <summary>
         /// Transmits a packet or a packet queue depending on Packet Size and length of data.
         /// </summary>

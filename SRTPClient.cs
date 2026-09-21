@@ -52,6 +52,10 @@ namespace ModemAPI
         /// </summary>
         public int MaxUnackedPackets = 10000;
         /// <summary>
+        /// How deep into the future packets will be received.
+        /// </summary>
+        public int MaxPacketNoFromFuture = 10000;
+        /// <summary>
         /// Delay in Ticks (each tick is 100 ns) between Universal Packet Sends.
         /// </summary>
         public int TicksPacketDelay = 0;
@@ -75,7 +79,7 @@ namespace ModemAPI
             }
         }
 
-        public SRTPClient(IModem modem, Address dst, string qt, uint cid, int tickTimeout)
+        public SRTPClient(IModem modem, Address dst, string qt, uint cid, int tickTimeout, bool autoclear = true)
         {
             ConnectionID = cid;
             QueryType = qt;
@@ -91,7 +95,7 @@ namespace ModemAPI
                 }
                 try
                 {
-                    byte[] dataReceived = packet.DataBytes.ToArray();
+                    byte[] dataReceived = packet.DataBytes;
                     // check IP end point
                     if (!IsFirstReceivedPacket)
                     {
@@ -113,6 +117,11 @@ namespace ModemAPI
                     if (dataReceived.Length > 8)
                     {
                         // == enqueue packets ==
+                        if (LastReceived + MaxPacketNoFromFuture < id)
+                        {
+                            OnError(-996, $"Packet {id} is too deep into the future.");
+                            return;
+                        }
                         ReorderingBuffer.TryAdd(id, dataReceived);
                     }
                 }
@@ -157,6 +166,52 @@ namespace ModemAPI
                     await Task.Delay(1);
                 }
             });
+            // autoclear task
+            if (autoclear)
+            {
+                _ = Task.Run(async delegate ()
+                {
+                    while (true)
+                    {
+                        ClearReorderingBuffer();
+                        await Task.Delay(1000);
+                    }
+                });
+            }
+        }
+        public bool AreAllPacketsFromReorderingBufferIncludedInAlreadyReceived()
+        {
+            foreach (long pno in ReorderingBuffer.Keys)
+            {
+                if (!ReceivedNumbers.Contains(pno))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+        /// <summary>
+        /// Counts packets for reordering.
+        /// </summary>
+        /// <returns>How many packets are in the reordering buffer of this instance of SRTPClient</returns>
+        public int CountReorderingPackets()
+        {
+            return ReorderingBuffer.Count;
+        }
+        public void ClearReorderingBuffer()
+        {
+            List<long> toRemove = [];
+            foreach (long pno in ReorderingBuffer.Keys)
+            {
+                if (ReceivedNumbers.Contains(pno))
+                {
+                    toRemove.Add(pno);
+                }
+            }
+            foreach (long pno in toRemove)
+            {
+                ReorderingBuffer.TryRemove(pno, out _);
+            }
         }
         public void Transmit(byte[] data)
         {

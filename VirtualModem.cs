@@ -57,6 +57,14 @@ namespace ModemAPI
         /// </summary>
         public Address? LocalModemAddress { get; set; }
         /// <summary>
+        /// Gets called once every reconnection retry for the RawWS transport.
+        /// </summary>
+        public Action OnReconnectWebsocket = delegate { };
+        /// <summary>
+        /// Gets called on a successful reconnect to the RawWS transport.
+        /// </summary>
+        public Action OnSuccessReconnectWebsocket = delegate { };
+        /// <summary>
         /// Creates a new instance of this Virtual Modem.
         /// </summary>
         /// <param name="domain">CIAS (Copybook Internet Access Server) domain name or IP Address</param>
@@ -745,9 +753,38 @@ namespace ModemAPI
                     throw new InvalidOperationException("transmitter device null");
                 }
                 byte[] payload = JsonSerializer.SerializeToUtf8Bytes(new object[] { "data-transmission", PacketConverter.PacketToWebSocketMessage(packet) });
-                await RawTransmitterDevice.SendAsync(payload, WebSocketMessageType.Text, true, default);
+                try
+                {
+                    await RawTransmitterDevice.SendAsync(payload, WebSocketMessageType.Text, true, default);
+                }
+                catch (OperationCanceledException)
+                {
+                    await ReconnectAsync();
+                }
+                catch (InvalidOperationException)
+                {
+                    await ReconnectAsync();
+                }
             }
             GenericPacketCounter++;
+        }
+        public void LowLevelTransmit(byte[] data, Address address, string qt, uint cid, string? metadata)
+        {
+            if (LocalModemAddress == null)
+            {
+                throw new NullAddressException();
+            }
+            Packet packet = new();
+            packet.PacketNo = 0;
+            packet.MessageId = (ulong)Random.Shared.NextInt64();
+            packet.Transmitter = LocalModemAddress;
+            packet.QueryType = qt;
+            packet.Receiver = address;
+            packet.ConnectionID = cid;
+            packet.Metadata = metadata;
+            packet.DataBytes = data;
+            packet.IsLastInSequence = true;
+            Transmit(packet);
         }
         /// <summary>
         /// Inner-method for attaching generic packet events.
@@ -987,8 +1024,10 @@ namespace ModemAPI
             {
                 try
                 {
+                    OnReconnectWebsocket();
                     RawTransmitterDevice = new ClientWebSocket();
                     await RawTransmitterDevice.ConnectAsync(new Uri(Cias), default);
+                    OnSuccessReconnectWebsocket();
                     return;
                 }
                 catch
