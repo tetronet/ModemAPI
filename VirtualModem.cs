@@ -744,7 +744,7 @@ namespace ModemAPI
                 {
                     throw new InvalidOperationException("transmitter device null");
                 }
-                await TransmitterDevice.EmitAsync("data-transmission", [PacketConverter.PacketToWebSocketMessage(packet)]);
+                TransmitterDevice.EmitAsync("data-transmission", [PacketConverter.PacketToWebSocketMessage(packet)]).Wait();
             }
             else
             {
@@ -755,15 +755,15 @@ namespace ModemAPI
                 byte[] payload = JsonSerializer.SerializeToUtf8Bytes(new object[] { "data-transmission", PacketConverter.PacketToWebSocketMessage(packet) });
                 try
                 {
-                    await RawTransmitterDevice.SendAsync(payload, WebSocketMessageType.Text, true, default);
+                    RawTransmitterDevice.SendAsync(payload, WebSocketMessageType.Text, true, default).Wait();
                 }
                 catch (OperationCanceledException)
                 {
-                    await ReconnectAsync();
+                    ReconnectAsync().Wait();
                 }
                 catch (InvalidOperationException)
                 {
-                    await ReconnectAsync();
+                    ReconnectAsync().Wait();
                 }
             }
             GenericPacketCounter++;
@@ -1027,6 +1027,7 @@ namespace ModemAPI
                     OnReconnectWebsocket();
                     RawTransmitterDevice = new ClientWebSocket();
                     await RawTransmitterDevice.ConnectAsync(new Uri(Cias), default);
+                    InternalModemConnected = true;
                     OnSuccessReconnectWebsocket();
                     return;
                 }
