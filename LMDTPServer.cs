@@ -66,7 +66,7 @@ namespace ModemAPI
                     temp.TicksPacketDelay = SrtpRateLimiting;
                     if (Clients.TryAdd((p.Transmitter, p.ConnectionID), temp))
                     {
-                        HandleClient(p.Transmitter, p.ConnectionID);
+                        HandleClient(p.Transmitter, p.ConnectionID, p.DataBytes);
                     }
                     else
                     {
@@ -97,75 +97,69 @@ namespace ModemAPI
             BinaryPrimitives.WriteInt64BigEndian(bytes[68..], reslen ?? 0);
             return bytes.ToArray();
         }
-        private void HandleClient(Address transmitter, uint connectid)
+        private void HandleClient(Address transmitter, uint connectid, byte[] data)
         {
             try
             {
                 if (Clients.TryGetValue((transmitter, connectid), out SRTPClient? tempClient))
                 {
-                    tempClient.OnMessageReceived += delegate (SRTPClient sender, byte[] data)
+                    try
                     {
-                        try
+                        Span<byte> bytes = new(data);
+                        if (BinaryPrimitives.ReadUInt16BigEndian(bytes) != LMDTPClient.LMDTP_REQUEST_PREFIX)
                         {
-                            Span<byte> bytes = new(data);
-                            if (BinaryPrimitives.ReadUInt16BigEndian(bytes) != LMDTPClient.LMDTP_REQUEST_PREFIX)
-                            {
-                                sender.Close();
-                                Clients.TryRemove((transmitter, connectid), out _);
-                                ErrorOccured(new InvalidDataException($"LMDTP Request Prefix does not match (expected: 0x{LMDTPClient.LMDTP_REQUEST_PREFIX:X4}, received: 0x{bytes[0]:X2}{bytes[1]:X2})"));
-                                return;
-                            }
-                            ushort resourceNameLength = BinaryPrimitives.ReadUInt16BigEndian(bytes[2..]);
-                            string resourceName = Encoding.UTF8.GetString(bytes.Slice(4, resourceNameLength));
-                            if (ResourceProvider?.GetResourceSize(resourceName) > BinaryPrimitives.ReadInt64BigEndian(bytes[(2 + 2 + resourceNameLength)..]))
-                            {
-                                sender.Transmit(ConstructResponseHeader(LMDTPResponseFlags.LargeMessageExceededMTU, 0, new byte[64]));
-                                sender.Close();
-                                Clients.TryRemove((transmitter, connectid), out _);
-                                ErrorOccured(new LargeMessageTooBigException("Resource Provider said there is more bytes, then client is proceeding to download"));
-                                return;
-                            }
-                            // send the response
-                            Stream? stream = ResourceProvider?.GetResource(resourceName);
-                            if (stream == null)
-                            {
-                                sender.Transmit(ConstructResponseHeader(LMDTPResponseFlags.ServerSideError, 0, new byte[64]));
-                                sender.Close();
-                                Clients.TryRemove((transmitter, connectid), out _);
-                                ErrorOccured(new ArgumentNullException(nameof(stream), "Resource Provider must return a valid non-null stream object"));
-                                return;
-                            }
-                            sender.Transmit(ConstructResponseHeader(LMDTPResponseFlags.Success, ResourceProvider?.GetResourceSize(resourceName), ResourceProvider?.GetResourceSha512Hashsum(resourceName)));
-                            Span<byte> packetBuffer = new byte[PacketMaxLength];
-                            byte[] buffer = new byte[PacketMaxLength];
-                            int bytesRead;
-                            while ((bytesRead = stream.Read(buffer, 0, buffer.Length)) > 0)
-                            {
-                                if (bytesRead < buffer.Length)
-                                {
-                                    // last chunk can be not full
-                                    byte[] lastChunk = new byte[bytesRead];
-                                    Array.Copy(buffer, lastChunk, bytesRead);
-                                    sender.Transmit(lastChunk);
-                                }
-                                else
-                                {
-                                    sender.Transmit(buffer);
-                                }
-                            }
-                            // close this client
-                            //Console.WriteLine("Currently there are clients: " + Clients.Count);
-                            //Console.WriteLine("LMDTP server closed");
-                            stream.Dispose();
-                            sender.Close();
+                            return;
+                        }
+                        ushort resourceNameLength = BinaryPrimitives.ReadUInt16BigEndian(bytes[2..]);
+                        string resourceName = Encoding.UTF8.GetString(bytes.Slice(4, resourceNameLength));
+                        if (ResourceProvider?.GetResourceSize(resourceName) > BinaryPrimitives.ReadInt64BigEndian(bytes[(2 + 2 + resourceNameLength)..]))
+                        {
+                            tempClient.Transmit(ConstructResponseHeader(LMDTPResponseFlags.LargeMessageExceededMTU, 0, new byte[64]));
+                            tempClient.Close();
                             Clients.TryRemove((transmitter, connectid), out _);
-                            //Console.WriteLine("And now there's clients: " + Clients.Count);
+                            ErrorOccured(new LargeMessageTooBigException("Resource Provider said there is more bytes, then client is proceeding to download"));
+                            return;
                         }
-                        catch (Exception ex)
+                        // send the response
+                        Stream? stream = ResourceProvider?.GetResource(resourceName);
+                        if (stream == null)
                         {
-                            ErrorOccured(ex);
+                            tempClient.Transmit(ConstructResponseHeader(LMDTPResponseFlags.ServerSideError, 0, new byte[64]));
+                            tempClient.Close();
+                            Clients.TryRemove((transmitter, connectid), out _);
+                            ErrorOccured(new ArgumentNullException(nameof(stream), "Resource Provider must return a valid non-null stream object"));
+                            return;
                         }
-                    };
+                        tempClient.Transmit(ConstructResponseHeader(LMDTPResponseFlags.Success, ResourceProvider?.GetResourceSize(resourceName), ResourceProvider?.GetResourceSha512Hashsum(resourceName)));
+                        Span<byte> packetBuffer = new byte[PacketMaxLength];
+                        byte[] buffer = new byte[PacketMaxLength];
+                        int bytesRead;
+                        while ((bytesRead = stream.Read(buffer, 0, buffer.Length)) > 0)
+                        {
+                            if (bytesRead < buffer.Length)
+                            {
+                                // last chunk can be not full
+                                byte[] lastChunk = new byte[bytesRead];
+                                Array.Copy(buffer, lastChunk, bytesRead);
+                                tempClient.Transmit(lastChunk);
+                            }
+                            else
+                            {
+                                tempClient.Transmit(buffer);
+                            }
+                        }
+                        // close this client
+                        //Console.WriteLine("Currently there are clients: " + Clients.Count);
+                        //Console.WriteLine("LMDTP server closed");
+                        stream.Dispose();
+                        tempClient.Close();
+                        Clients.TryRemove((transmitter, connectid), out _);
+                        //Console.WriteLine("And now there's clients: " + Clients.Count);
+                    }
+                    catch (Exception ex)
+                    {
+                        ErrorOccured(ex);
+                    }
                 }
                 else
                 {

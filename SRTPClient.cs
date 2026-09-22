@@ -241,11 +241,7 @@ namespace ModemAPI
         }
         private void UnivSend(byte[]? data)
         {
-            long remainingTicks = TicksPacketDelay - (DateTime.Now.Ticks - InternalPacketTimer);
-            if (remainingTicks > 0)
-            {
-                Thread.Sleep(TimeSpan.FromTicks(remainingTicks));
-            }
+            while (TicksPacketDelay > DateTime.Now.Ticks - InternalPacketTimer) { }
             if (data == null)
             {
                 return;
