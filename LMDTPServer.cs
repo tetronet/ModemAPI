@@ -30,6 +30,7 @@ namespace ModemAPI
         /// Gets or sets maximum length of the packet used in response transmission (default is 8000).
         /// </summary>
         public int PacketMaxLength = 8000;
+        public event Action<Address, uint> SRTPClientReceived = delegate { };
         /// <summary>
         /// Creates a new instance of LMDTPServer.
         /// </summary>
@@ -56,27 +57,35 @@ namespace ModemAPI
             BaseModem.AttachReceiveEventNoUnfragment(delegate (Packet p, Action k)
             {
                 //Console.WriteLine($"Received net data: address={p.Transmitter} qt={p.QueryType} cid={p.ConnectionID}");
-                if (CheckGrayList(p.Transmitter))
+                Task.Run(delegate ()
                 {
-                    if (Clients.ContainsKey((p.Transmitter, p.ConnectionID)))
+                    if (CheckGrayList(p.Transmitter))
                     {
-                        return;
-                    }
-                    SRTPClient temp = new(BaseModem, p.Transmitter, "lm_tunnel", p.ConnectionID, SrtpTimeout);
-                    temp.TicksPacketDelay = SrtpRateLimiting;
-                    if (Clients.TryAdd((p.Transmitter, p.ConnectionID), temp))
-                    {
-                        HandleClient(p.Transmitter, p.ConnectionID, p.DataBytes);
+                        if (Clients.ContainsKey((p.Transmitter, p.ConnectionID)) || BinaryPrimitives.ReadUInt16BigEndian(p.DataBytes) != LMDTPClient.LMDTP_REQUEST_PREFIX)
+                        {
+                            return;
+                        }
+                        SRTPClient temp = new(BaseModem, p.Transmitter, "lm_tunnel", p.ConnectionID, SrtpTimeout);
+                        temp.TicksPacketDelay = SrtpRateLimiting;
+                        temp.OnError += delegate (int code, string desc)
+                        {
+                            ErrorOccured(new Exception($"SRTP ERRNO {code}: {desc}"));
+                        };
+                        SRTPClientReceived(p.Transmitter, p.ConnectionID);
+                        if (Clients.TryAdd((p.Transmitter, p.ConnectionID), temp))
+                        {
+                            HandleClient(p.Transmitter, p.ConnectionID, p.DataBytes);
+                        }
+                        else
+                        {
+                            //Console.WriteLine($"Failed to add client from adddress {p.Transmitter} and Cid {p.ConnectionID}");
+                        }
                     }
                     else
                     {
-                        //Console.WriteLine($"Failed to add client from adddress {p.Transmitter} and Cid {p.ConnectionID}");
+                        ErrorOccured(new UnauthorizedAccessException($"User from remote address {p.Transmitter} was trying to access this LMDTP while he is {(IsListBlackOrWhite ? "not included in White" : "is included in Black")} List"));
                     }
-                }
-                else
-                {
-                    ErrorOccured(new UnauthorizedAccessException($"User from remote address {p.Transmitter} was trying to access this LMDTP while he is {(IsListBlackOrWhite ? "not included in White" : "is included in Black")} List"));
-                }
+                });
                 //Console.WriteLine("Processed all net data");
             });
         }
@@ -105,6 +114,8 @@ namespace ModemAPI
                 {
                     try
                     {
+                        //tempClient.OnAckReceived += delegate (long p) { Console.WriteLine("ack lmdtp server"); };
+                        //tempClient.OnRetransmit += delegate (long p) { Console.WriteLine("retx lmdtp server"); };
                         Span<byte> bytes = new(data);
                         if (BinaryPrimitives.ReadUInt16BigEndian(bytes) != LMDTPClient.LMDTP_REQUEST_PREFIX)
                         {

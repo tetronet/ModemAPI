@@ -736,7 +736,7 @@ namespace ModemAPI
         /// </summary>
         /// <param name="packet">Packet for transmitting</param>
         /// <exception cref="InvalidOperationException">When something goes wrong</exception>
-        internal async void Transmit(Packet packet)
+        internal void Transmit(Packet packet)
         {
             if (!WebSocketOrSocketIO)
             {

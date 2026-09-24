@@ -19,17 +19,21 @@ namespace ModemAPI
         private IModem UnderlyingModem;
         private Address Destination;
         private uint ConnectionID;
-        public event Action<LMDTPClient, byte[]> ResponseReceived = delegate { };
         public event Action<Exception> ErrorOccured = delegate { };
         private bool IsReceivingData = false;
-        private byte[]? PrivateLargeMessageReceiveBuffer;
+        private byte[] PrivateLargeMessageReceiveBuffer = [];
         private int LargeMessageReceiveBufferCursor = 0;
         private bool IsFirstPacket = true;
         private long TimestampRequestSent = 0;
         private byte[] SHA512Received = new byte[64];
+        public int CurrentDownloadBytes { get { return LargeMessageReceiveBufferCursor; } }
         public LMDTPClient(IModem baseModem, Address dest, uint cid, int srtpTimeoutTicks)
         {
             UnderlyingClient = new(baseModem, dest, "lm_tunnel", cid, srtpTimeoutTicks);
+            UnderlyingClient.OnError += delegate (int code, string desc)
+            {
+                ErrorOccured(new Exception($"SRTP ERRNO {code}: {desc}"));
+            };
             UnderlyingModem = baseModem;
             Destination = dest;
             ConnectionID = cid;
@@ -41,7 +45,7 @@ namespace ModemAPI
         /// <param name="maxDownloadBytes">How much data is OK to be downloaded</param>
         /// <param name="ticksTimeout">How much ticks this request can wait without packets before throwing <see cref="TimeoutException"/></param>
         /// <exception cref="ArgumentOutOfRangeException"></exception>
-        public void Request(string remoteResourceName, long maxDownloadBytes, int ticksTimeout = 50000000)
+        public byte[] Request(string remoteResourceName, long maxDownloadBytes, int ticksTimeout = 50000000)
         {
             // format:
             // 2 bytes prefix
@@ -69,8 +73,9 @@ namespace ModemAPI
                 {
                     throw new TimeoutException("LMDTP Obtain Request timed out...");
                 }
-                Thread.Sleep(1);
+                Thread.Sleep(100);
             }
+            return PrivateLargeMessageReceiveBuffer;
         }
         private void SRTPDataEvent(SRTPClient sender, byte[] data)
         {
@@ -135,11 +140,9 @@ namespace ModemAPI
                         {
                             if (SHA512.HashData(PrivateLargeMessageReceiveBuffer).SequenceEqual(SHA512Received))
                             {
-                                ResponseReceived(this, PrivateLargeMessageReceiveBuffer);
                                 LargeMessageReceiveBufferCursor = 0;
                                 IsFirstPacket = true;
                                 IsReceivingData = false;
-                                PrivateLargeMessageReceiveBuffer = null;
                             }
                             else
                             {

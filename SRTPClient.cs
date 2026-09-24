@@ -8,6 +8,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace ModemAPI
 {
@@ -16,7 +17,6 @@ namespace ModemAPI
         private Address? CommunicatingWith = null;
         private uint ConnectionID = 0;
         private string QueryType = "";
-        private bool IsFirstReceivedPacket = false;
         private IModem Modem;
         private long LastReceived = -1;
         private long SequentialPacketNumber = 0;
@@ -40,9 +40,13 @@ namespace ModemAPI
         /// </summary>
         public Action<long> OnRetransmit = delegate { };
         /// <summary>
-        /// Gets called for each acknowledged packet, and Sequential ID is sent to the event handler.
+        /// Gets called for each acknowledgement packet, and Sequential ID is sent to the event handler.
         /// </summary>
         public Action<long> OnAckReceived = delegate { };
+        /// <summary>
+        /// Gets called for each acknowledgement packet sending.
+        /// </summary>
+        public Action<long> OnAckTransmitted = delegate { };
         /// <summary>
         /// Gets called for each packet that is out of order, and Sequential ID is sent to the event handler.
         /// </summary>
@@ -91,16 +95,12 @@ namespace ModemAPI
             {
                 if (packet.ConnectionID != ConnectionID || packet.QueryType != QueryType)
                 {
+                    Console.WriteLine("SRTPClient MISMATCH CID OR QT!!!!!!!!!");
                     return;
                 }
                 try
                 {
                     byte[] dataReceived = packet.DataBytes;
-                    // check IP end point
-                    if (!IsFirstReceivedPacket)
-                    {
-                        IsFirstReceivedPacket = true;
-                    }
                     // parse received packet
                     if (dataReceived.Length < 8)
                     {
@@ -108,6 +108,7 @@ namespace ModemAPI
                         return;
                     }
                     long id = BinaryPrimitives.ReadInt64BigEndian(dataReceived);
+                    
                     if (dataReceived.Length == 8)
                     {
                         // == ack receiver ==
@@ -221,12 +222,13 @@ namespace ModemAPI
             }
             while (InternalState.Count > MaxUnackedPackets)
             {
-                Thread.Sleep(1);
+                OnError(-1885, "Pending for acknowledgement packets storage is full");
+                Thread.Sleep(100);
             }
             byte[] data_ = new byte[data.Length + 8];
             BinaryPrimitives.WriteInt64BigEndian(data_.AsSpan(), SequentialPacketNumber);
             data.CopyTo(data_, 8);
-            InternalState.TryAdd(SequentialPacketNumber, new ReliablePacketInformation(SequentialPacketNumber, DateTime.Now.Ticks, data_));
+            InternalState.TryAdd(SequentialPacketNumber, new(SequentialPacketNumber, DateTime.Now.Ticks, data_));
             Interlocked.Increment(ref SequentialPacketNumber);
             UnivSend(data_);
         }
@@ -251,7 +253,7 @@ namespace ModemAPI
                 OnError(1048576, "This client does not communicate with any remote system.");
                 return;
             }
-            Modem.Transmit(data, CommunicatingWith, QueryType, ConnectionID, packetSize: 60000);
+            Modem.LowLevelTransmit(data, CommunicatingWith, QueryType, ConnectionID);
             InternalPacketTimer = DateTime.Now.Ticks;
         }
         private void ForceReadAllAvailablePackets()
@@ -272,10 +274,6 @@ namespace ModemAPI
                 Interlocked.Increment(ref LastReceived); // increment LastReceived so everything will work
                 ModemAPIDebugger.OutputDebugMessage("increment: " + LastReceived);
             }
-        }
-        private static bool CheckIPEndPointEquality(IPEndPoint a, IPEndPoint b)
-        {
-            return a.Address.Equals(b.Address) && a.Port.Equals(b.Port);
         }
     }
 }
