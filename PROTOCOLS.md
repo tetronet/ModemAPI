@@ -78,3 +78,21 @@ Sometimes is used, to know if one of the sides died to prevent desyncing states.
 | 0x22FF22FF |
 +------------+
 ```
+##### Terms
+```
+LowLatency Connection Respone Flags:
+0b00000001 - large message exchange supported (obsolete)
+0b00000010 - SMLA is contained in the response (Set Modem Local Address)
+0b00000100 - RESERVED
+0b00001000 - connection response provides maximum packet size
+0b00010000 - connection response provides maximum large message size (obsolete)
+0b00100000 - connection response provides timeout without keep-alives
+0b01000000 - RESERVED
+0b10000000 - RESERVED
+
+Empty address:
+The address contains a "0", or it's empty (no address characters in it).
+
+Invalid address:
+The address contains characters outside of list (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, -), or it's an address, which can't be used to connect to the tetronet through a point, handling the current connection process.
+```
