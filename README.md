@@ -63,7 +63,7 @@ dotnet add package System.IO.Hashing
 ```
 
 ### CIASes
-You can create your own, or use one of mine:
+You can create your own, or use one of mine for testing:
 - `wss://data-set.su:3000/` - is for Socket.IO connections
 - `ws://data-set.su:30000/` - is for Raw websocket connections
 
