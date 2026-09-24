@@ -19,7 +19,8 @@ Low Latency - Copybook Internet over Copybook Internet Lines - mini. How it work
 | (1 byte - response flags*)                                                               |
 | (data, defined by the flags)                                                             |
 | (4 bytes CRC-32)                                                                         |
-| depending on the flags these can be in this odrer between the flags and the CRC-32:      |
++------------------------------------------------------------------------------------------+
+| depending on the flags these can be in this order between the flags and the CRC-32:      |
 | SMLA for the endpoint                                                                    |
 | (1 byte length) (0-255 bytes address)                                                    |
 | maximum MTU (packet)                                                                     |
@@ -41,7 +42,7 @@ Low Latency - Copybook Internet over Copybook Internet Lines - mini. How it work
 | 0x4c4c537465726d6f6b |
 +----------------------+
 ```
-##### Exchanging packets
+##### Exchanging packets (fire-and-forget)
 ```
 +----------------------------------------------------------------------------------------------+
 | 0x56923ffd                                                                                   |
@@ -50,7 +51,7 @@ Low Latency - Copybook Internet over Copybook Internet Lines - mini. How it work
 | (length byte) (0-255 bytes query type)                                                       |
 | (4 bytes ConnectionID)                                                                       |
 | (1 byte is the packet last in queue false - 0x27, true - 0xfa)                               |
-| (8 bytes sequentional number of the network level fragmentation, package_no)                 |
+| (8 bytes sequential number of the network level fragmentation, package_no)                   |
 | (8 bytes id of the message that this packet participates in)                                 |
 | (2 byte length) (0-65536 bytes packet data)                                                  |
 | (2 byte length) (0-65536 bytes packet metadata, can contain only symbols from a list)        |
@@ -61,6 +62,7 @@ Low Latency - Copybook Internet over Copybook Internet Lines - mini. How it work
                                  +----------------+
                                  | No response :) |
                                  +----------------+
+* Metadata can contain only the symbols from PrintableCharacters string in the PrintableCharacterList.cs file
 ```
 ##### Large Messages
 ```
