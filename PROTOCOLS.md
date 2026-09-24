@@ -6,7 +6,6 @@ Low Latency - Copybook Internet over Copybook Internet Lines - mini. How it work
 
 ##### Connection establishment:
 ```
-
 +----------------------------------------------------------------------+
 | 0x4c4c2d43496f43494c2d6d696e                                         |
 | (1 byte length) (0-255 current CI address of the connecting system)  |
@@ -42,4 +41,40 @@ Low Latency - Copybook Internet over Copybook Internet Lines - mini. How it work
 | 0x4c4c537465726d6f6b |
 +----------------------+
 ```
-##### Sending packets and everything else will be diagramed later on, so be patient ;)
+##### Exchanging packets
+```
++----------------------------------------------------------------------------------------------+
+| 0x56923ffd                                                                                   |
+| (length byte) (0-255 bytes receiver address)                                                 |
+| (length byte) (0-255 bytes transmitter address)                                              |
+| (length byte) (0-255 bytes query type)                                                       |
+| (4 bytes ConnectionID)                                                                       |
+| (1 byte is the packet last in queue false - 0x27, true - 0xfa)                               |
+| (8 bytes sequentional number of the network level fragmentation, package_no)                 |
+| (8 bytes id of the message that this packet participates in)                                 |
+| (2 byte length) (0-65536 bytes packet data)                                                  |
+| (2 byte length) (0-65536 bytes packet metadata, can contain only symbols from a list)        |
+| (4 bytes CRC-32)                                                                             |
++----------------------------------------------------------------------------------------------+
+                                          |
+                                          V
+                                 +----------------+
+                                 | No response :) |
+                                 +----------------+
+```
+##### Large Messages
+```
+Large Messages in the tetronet are considered deprecated, consider using LMDTPServer and LMDTPClient, they're like a billion times faster and they don't have limitations for the size that you want to download because of that one address machine on the ceiling from 2000 years ago. LMDTP doesn't need so all of the address machines on the route will have enough space to store the large message, LMDTP is Large Message Direct Tunnel Protocol.
+```
+##### Keep-alive
+```
+Sometimes is used, to know if one of the sides died to prevent desyncing states. For example if 3 keep-alives in a row receive a timeout, that can mean that the address machine is dead, and if the address machine doesn't receive the keep-alives for example for 120 seconds, it means the endpoint is dead and the states could be cleaned up.
++------------+
+| 0x77997799 |
++------------+
+       |
+       V
++------------+
+| 0x22FF22FF |
++------------+
+```
