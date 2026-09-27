@@ -30,7 +30,11 @@ namespace ModemAPI
         /// Gets or sets maximum length of the packet used in response transmission (default is 8000).
         /// </summary>
         public int PacketMaxLength = 8000;
+        /// <summary>
+        /// When a new reliable client appears.
+        /// </summary>
         public event Action<Address, uint> SRTPClientReceived = delegate { };
+        public bool SrtpEnablePacketLossBasedRateLimiter = false;
         /// <summary>
         /// Creates a new instance of LMDTPServer.
         /// </summary>
@@ -66,6 +70,7 @@ namespace ModemAPI
                             return;
                         }
                         SRTPClient temp = new(BaseModem, p.Transmitter, "lm_tunnel", p.ConnectionID, SrtpTimeout);
+                        temp.PacketLossBasedCongestionControl = SrtpEnablePacketLossBasedRateLimiter;
                         temp.TicksPacketDelay = SrtpRateLimiting;
                         temp.OnError += delegate (int code, string desc)
                         {

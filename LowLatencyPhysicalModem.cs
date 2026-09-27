@@ -7,6 +7,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 
 namespace ModemAPI
@@ -20,14 +21,45 @@ namespace ModemAPI
         private PacketQueueAssembler Assembler = new(1000000, 600000000); // 1 million packet queues at the same time, 60 seconds timeout
         private bool CurrentlyWritingPacket = false;
         private readonly Lock WriterLock = new();
-        
+        private readonly Channel<Packet> TransmissionQueue =
+            Channel.CreateBounded<Packet>(new BoundedChannelOptions(1024)
+            {
+                FullMode = BoundedChannelFullMode.DropOldest,
+                SingleReader = true,
+                SingleWriter = false
+            });
+        private volatile bool TxLoopWorking = false;
+
         public int MaxReinitializeAttempts { get; set; }
+        /// <summary>
+        /// Local tetronet address for this modem.
+        /// </summary>
         public Address? LocalModemAddress { get; set; }
+        /// <summary>
+        /// Last downloaded <see cref="LargeMessage"/> by this <see cref="LowLatencyPhysicalModem"/> instance or null if there's no one.
+        /// </summary>
+        [Obsolete("Large messages in the tetronet must get replaced by LMDTP transfers")]
         public LargeMessage? LastDownloadedLargeMessage { get; set; }
+        /// <summary>
+        /// Connect this modem as an address machine.
+        /// </summary>
         public bool ConnectAsAnAddressMachine { get; set; }
+        /// <summary>
+        /// MTU for the Packets
+        /// </summary>
         public int PacketMTU { get; private set; }
+        /// <summary>
+        /// MTU for the Large Messages
+        /// </summary>
         public ulong LargeMessageMTU { get; private set; }
         public bool CanExchangeLargeMessages { get; private set; }
+        /// <summary>
+        /// Counts locally dropped packets.
+        /// </summary>
+        public long LocallyDroppedPacketsCounter { get; private set; }
+        /// <summary>
+        /// True if this <see cref="LowLatencyPhysicalModem"/> is connected, and false if not.
+        /// </summary>
         public bool IsModemConnected { get; set; }
         /// <summary>
         /// Allow this modem to drop packets once the serial port is overloaded.
@@ -253,6 +285,7 @@ namespace ModemAPI
         /// <param name="atCommands"></param>
         /// <param name="afterAtCommandDelay"></param>
         /// <exception cref="NotSupportedException"></exception>
+        [Obsolete("Dial-up modems are very obsolete, and this constructor doesn't support a lot of stuff, use the other one")]
         public LowLatencyPhysicalModem(string wire, int speed, L1Types wt, string[] atCommands, int afterAtCommandDelay)
         {
             LevelOneWireType = wt;
@@ -531,10 +564,60 @@ namespace ModemAPI
         {
             lock (WriterLock)
             {
-                if (!CurrentlyWritingPacket)
+                TransmissionQueue.Writer.TryWrite(packet);
+                if (!TxLoopWorking)
                 {
-                    CurrentlyWritingPacket = true;
-                    Task.Run(() => { Communicator.Write(PacketConverter.PacketToBytes(packet)); CurrentlyWritingPacket = false; });
+                    TxLoopWorking = true;
+                    try
+                    {
+                        Task.Run(async delegate ()
+                        {
+                            try
+                            {
+                                while (true)
+                                {
+                                    try
+                                    {
+                                        if (!await TransmissionQueue.Reader.WaitToReadAsync())
+                                        {
+                                            lock (WriterLock)
+                                            {
+                                                TxLoopWorking = false;
+                                            }
+                                            break;
+                                        }
+                                        if (TransmissionQueue.Reader.TryRead(out Packet? thePacket))
+                                        {
+                                            Communicator.Write(PacketConverter.PacketToBytes(thePacket));
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        InternalErrorHappened(ex, ErrorEmitter.LowLatencyPhysicalModem);
+                                        lock (WriterLock)
+                                        {
+                                            TxLoopWorking = false;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            finally
+                            {
+                                lock (WriterLock)
+                                {
+                                    TxLoopWorking = false;
+                                }
+                            }
+                        });
+                    }
+                    catch
+                    {
+                        lock (WriterLock)
+                        {
+                            TxLoopWorking = false;
+                        }
+                    }
                 }
             }
         }

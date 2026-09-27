@@ -1,14 +1,6 @@
-﻿using System;
-using System.Buffers.Binary;
+﻿using System.Buffers.Binary;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Globalization;
-using System.Linq;
-using System.Net;
-using System.Net.Sockets;
-using System.Text;
-using System.Threading.Tasks;
-using static System.Runtime.InteropServices.JavaScript.JSType;
+using System.Diagnostics;
 
 namespace ModemAPI
 {
@@ -26,7 +18,7 @@ namespace ModemAPI
         private ConcurrentDictionary<long, byte[]> ReorderingBuffer = new ConcurrentDictionary<long, byte[]>();
         private ConcurrentDictionary<long, ReliablePacketInformation> InternalState = new ConcurrentDictionary<long, ReliablePacketInformation>();
         private long InternalPacketTimer = 0;
-
+        private volatile bool IsThrottled = false;
         /// <summary>
         /// Gets called for each received message by this client, and data of this message is sent to the event handler.
         /// </summary>
@@ -63,6 +55,10 @@ namespace ModemAPI
         /// Delay in Ticks (each tick is 100 ns) between Universal Packet Sends.
         /// </summary>
         public int TicksPacketDelay = 0;
+        /// <summary>
+        /// If set to true, this client will stop sending any data for 2s on each retransmitted packet to prevent tetronet from doing OHHH MYY PCCCCAEAEAE
+        /// </summary>
+        public bool PacketLossBasedCongestionControl = false;
         /// <summary>
         /// Gets the remote address, which this SRTP client is currently communicating with.
         /// </summary>
@@ -136,19 +132,39 @@ namespace ModemAPI
             {
                 while (!IsClosed)
                 {
-                    foreach (ReliablePacketInformation info in InternalState.Values)
+                    try
                     {
-                        if (info.CheckTimeout(TicksTimeout))
+                        foreach (ReliablePacketInformation info in InternalState.Values)
                         {
-                            // retransmit packets
-                            UnivSend(info.Data);
-                            // update timeout
-                            info.UpdateTimeStamp();
-                            // call the user event
-                            OnRetransmit(info.Id);
+                            if (info.CheckTimeout(TicksTimeout))
+                            {
+                                // retransmit packets
+                                UnivSend(info.Data);
+                                // update timeout
+                                info.UpdateTimeStamp();
+                                // if enabled, pause the transmission
+                                if (PacketLossBasedCongestionControl)
+                                {
+                                    _ = Task.Run(delegate ()
+                                    {
+                                        if (!IsThrottled)
+                                        {
+                                            IsThrottled = true;
+                                            Thread.Sleep(2000);
+                                            IsThrottled = false;
+                                        }
+                                    });
+                                }
+                                // call the user event
+                                OnRetransmit(info.Id);
+                            }
                         }
+                        await Task.Delay(100);
                     }
-                    await Task.Delay(100);
+                    catch (Exception ex)
+                    {
+                        OnError(1870, "Retransmit Exception: " + ex);
+                    }
                 }
             });
             // reorder task
@@ -225,6 +241,10 @@ namespace ModemAPI
                 OnError(-1885, "Pending for acknowledgement packets storage is full");
                 Thread.Sleep(100);
             }
+            while (IsThrottled)
+            {
+                Thread.Sleep(50);
+            }
             byte[] data_ = new byte[data.Length + 8];
             BinaryPrimitives.WriteInt64BigEndian(data_.AsSpan(), SequentialPacketNumber);
             data.CopyTo(data_, 8);
@@ -243,18 +263,26 @@ namespace ModemAPI
         }
         private void UnivSend(byte[]? data)
         {
-            while (TicksPacketDelay > DateTime.Now.Ticks - InternalPacketTimer) { }
-            if (data == null)
+            try
             {
-                return;
+                while (TicksPacketDelay > Stopwatch.GetTimestamp() - InternalPacketTimer) { }
+                //SpinWait.SpinUntil(delegate () { return TicksPacketDelay > Stopwatch.GetTimestamp() - InternalPacketTimer; });
+                if (data == null)
+                {
+                    return;
+                }
+                if (CommunicatingWith == null)
+                {
+                    OnError(1048576, "This client does not communicate with any remote system.");
+                    return;
+                }
+                Modem.LowLevelTransmit(data, CommunicatingWith, QueryType, ConnectionID);
+                InternalPacketTimer = Stopwatch.GetTimestamp();
             }
-            if (CommunicatingWith == null)
+            catch (Exception ex)
             {
-                OnError(1048576, "This client does not communicate with any remote system.");
-                return;
+                OnError(1800, "UNIVSEND failed: " + ex);
             }
-            Modem.LowLevelTransmit(data, CommunicatingWith, QueryType, ConnectionID);
-            InternalPacketTimer = DateTime.Now.Ticks;
         }
         private void ForceReadAllAvailablePackets()
         {

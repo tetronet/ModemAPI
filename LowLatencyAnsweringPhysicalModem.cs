@@ -8,6 +8,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 
 namespace ModemAPI
@@ -30,9 +31,21 @@ namespace ModemAPI
         private Address ClientAddress = new();
         private ulong TimeoutNs = 0;
         private List<Action> CRCMismatchEvents = [];
+        private readonly Channel<Packet> TransmissionQueue =
+            Channel.CreateBounded<Packet>(new BoundedChannelOptions(1024)
+            {
+                FullMode = BoundedChannelFullMode.DropOldest,
+                SingleReader = true,
+                SingleWriter = false
+            });
+        private volatile bool TxLoopWorking = false;
 
         private bool CurrentlyWritingPacket = false;
         private readonly Lock WriterLock = new();
+        /// <summary>
+        /// Gets invoked if some shit happens in the modem.
+        /// </summary>
+        public event Action<Exception, ErrorEmitter> InternalErrorHappened = delegate { };
 
         /// <summary>
         /// Gets invoked if any data gets dropped by the underlying Level One client, and argument will contain exact count of dropped bytes
@@ -279,6 +292,7 @@ namespace ModemAPI
                     {
                         L1DroppedData(reason, count);
                     };
+                    p_.InternalErrorHappened += InternalErrorHappened;
                     p = p_;
                 }
                 Communicator = new(null, null, p);
@@ -478,10 +492,60 @@ namespace ModemAPI
         {
             lock (WriterLock)
             {
-                if (!CurrentlyWritingPacket)
+                TransmissionQueue.Writer.TryWrite(packet);
+                if (!TxLoopWorking)
                 {
-                    CurrentlyWritingPacket = true;
-                    Task.Run(() => { Communicator.Write(PacketConverter.PacketToBytes(packet)); CurrentlyWritingPacket = false; });
+                    TxLoopWorking = true;
+                    try
+                    {
+                        Task.Run(async delegate ()
+                        {
+                            try
+                            {
+                                while (true)
+                                {
+                                    try
+                                    {
+                                        if (!await TransmissionQueue.Reader.WaitToReadAsync())
+                                        {
+                                            lock (WriterLock)
+                                            {
+                                                TxLoopWorking = false;
+                                            }
+                                            break;
+                                        }
+                                        if (TransmissionQueue.Reader.TryRead(out Packet? thePacket))
+                                        {
+                                            Communicator.Write(PacketConverter.PacketToBytes(thePacket));
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        InternalErrorHappened(ex, ErrorEmitter.LowLatencyPhysicalModem);
+                                        lock (WriterLock)
+                                        {
+                                            TxLoopWorking = false;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            finally
+                            {
+                                lock (WriterLock)
+                                {
+                                    TxLoopWorking = false;
+                                }
+                            }
+                        });
+                    }
+                    catch
+                    {
+                        lock (WriterLock)
+                        {
+                            TxLoopWorking = false;
+                        }
+                    }
                 }
             }
         }
