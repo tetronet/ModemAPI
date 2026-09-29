@@ -15,6 +15,7 @@
             public bool? is_last_in_package_queue { get; set; }
             public ulong? package_no { get; set; }
             public ulong? message_id { get; set; }
+            public ushort? max_hops { get; set; }
         }
     }
 }

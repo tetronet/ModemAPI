@@ -1,10 +1,11 @@
 ﻿using SocketIOClient;
-using System.Text;
-using System.IO.Ports;
-using System.IO.Hashing;
-using System.Net.WebSockets;
 using System.Buffers;
+using System.IO.Hashing;
+using System.IO.Ports;
+using System.Net.WebSockets;
+using System.Text;
 using System.Text.Json;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace ModemAPI
 {
@@ -280,6 +281,11 @@ namespace ModemAPI
                 //Console.WriteLine("==== [at VirtualModem.cs at line 169] ====");
                 //Console.WriteLine(Environment.StackTrace);
                 //ModemAPIDebugger.PrintOutPacket(data);
+                if (data.RoutersToPass == 0)
+                {
+                    return; // ttl too low
+                }
+                data.RoutersToPass--;
                 if (InnerRouter != null && InnerRouter.Decide(new(data.Transmitter, data.Receiver), PacketTransmissionDirection.FromUpperToLower) == PacketRouterDecidion.ForwardDown)
                 {
                     Transmit(data);
@@ -301,6 +307,11 @@ namespace ModemAPI
                 ModemAPIDebugger.OutputDebugMessage("Forwarding to port: " + AddressPortPairs.GetValueOrDefault(receivedPacket.Receiver.AddressValue ?? ""));
                 if (AddressPortPairs.TryGetValue(receivedPacket.Receiver.AddressValue ?? "", out string? value))
                 {
+                    if (receivedPacket.RoutersToPass == 0)
+                    {
+                        return; // ttl too low
+                    }
+                    receivedPacket.RoutersToPass--;
                     ModemAPIDebugger.OutputDebugMessage("forward ok");
                     receivedPacket.Metadata ??= "";
                     if (InnerRouter != null && InnerRouter.Decide(new(receivedPacket.Transmitter, receivedPacket.Receiver), PacketTransmissionDirection.FromLowerToUpper) == PacketRouterDecidion.ForwardInInnerNetwork)
@@ -363,6 +374,11 @@ namespace ModemAPI
                 //Console.WriteLine("==== [at VirtualModem.cs at line 169] ====");
                 //Console.WriteLine(Environment.StackTrace);
                 //ModemAPIDebugger.PrintOutPacket(data);
+                if (data.RoutersToPass == 0)
+                {
+                    return; // ttl too low
+                }
+                data.RoutersToPass--;
                 if (InnerRouter != null && InnerRouter.Decide(new(data.Transmitter, data.Receiver), PacketTransmissionDirection.FromUpperToLower) == PacketRouterDecidion.ForwardDown)
                 {
                     Transmit(data);
@@ -384,6 +400,11 @@ namespace ModemAPI
                 ModemAPIDebugger.OutputDebugMessage("Forwarding to port: " + AddressPortPairs.GetValueOrDefault(receivedPacket.Receiver.AddressValue ?? ""));
                 if (AddressPortPairs.TryGetValue(receivedPacket.Receiver.AddressValue ?? "", out string? value))
                 {
+                    if (receivedPacket.RoutersToPass == 0)
+                    {
+                        return; // ttl too low
+                    }
+                    receivedPacket.RoutersToPass--;
                     ModemAPIDebugger.OutputDebugMessage("forward ok");
                     receivedPacket.Metadata ??= "";
                     if (InnerRouter != null && InnerRouter.Decide(new(receivedPacket.Transmitter, receivedPacket.Receiver), PacketTransmissionDirection.FromLowerToUpper) == PacketRouterDecidion.ForwardInInnerNetwork)
@@ -660,7 +681,7 @@ namespace ModemAPI
         /// <param name="packetSize">Max amount of bytes in a single packet in a packet queue</param>
         /// <param name="delay">Delay between transmitting each packet in the queue, useful for overloaded/slow network</param>
         /// <exception cref="NullAddressException">Happens when transmitting modem does not have any tetronet address</exception>
-        public void Transmit(byte[] data, Address address, string queryType, uint connectionId, string? metadata = null, ushort packetSize = 1024, int delay = 0)
+        public void Transmit(byte[] data, Address address, string queryType, uint connectionId, string? metadata = null, ushort packetSize = 1024, int delay = 0, ushort ttl = 65535)
         {
             if (LocalModemAddress == null)
             {
@@ -682,6 +703,7 @@ namespace ModemAPI
                 packet.Transmitter = LocalModemAddress;
                 packet.PacketNo = (byte)(i / packetSize);
                 packet.MessageId = mid;
+                packet.RoutersToPass = ttl;
                 Transmit(packet);
                 Thread.Sleep(delay);
             }
@@ -697,7 +719,7 @@ namespace ModemAPI
         /// <param name="packetSize">Max amount of bytes in a single packet in a packet queue</param>
         /// <param name="delay">Delay between transmitting each packet in the queue, useful for overloaded/slow network</param>
         /// <exception cref="NullAddressException">Happens when transmitting modem does not have any tetronet address</exception>
-        public void Transmit(string data, Address address, string queryType, uint connectionId, string? metadata = null, ushort packetSize = 1024, int delay = 0)
+        public void Transmit(string data, Address address, string queryType, uint connectionId, string? metadata = null, ushort packetSize = 1024, int delay = 0, ushort ttl = 65535)
         {
             if (LocalModemAddress == null)
             {
@@ -717,6 +739,7 @@ namespace ModemAPI
                 packet.Transmitter = LocalModemAddress;
                 packet.PacketNo = (byte)(i / packetSize);
                 packet.MessageId = mid;
+                packet.RoutersToPass = ttl;
                 //Console.WriteLine("the value at line 258 is : " + (i + packetSize) + " and packet estimated packsize will be : " + packetSize);
                 //Console.WriteLine("the value at line 259 is : " + new string(data.ToCharArray().Skip(i).Take(packetSize).ToArray()));
                 Transmit(packet);
@@ -768,7 +791,7 @@ namespace ModemAPI
             }
             GenericPacketCounter++;
         }
-        public void LowLevelTransmit(byte[] data, Address address, string qt, uint cid, string? metadata)
+        public void LowLevelTransmit(byte[] data, Address address, string qt, uint cid, string? metadata, ushort ttl = 65535)
         {
             if (LocalModemAddress == null)
             {
@@ -784,16 +807,13 @@ namespace ModemAPI
             packet.Metadata = metadata;
             packet.DataBytes = data;
             packet.IsLastInSequence = true;
+            packet.RoutersToPass = ttl;
             Transmit(packet);
         }
         /// <summary>
         /// Inner-method for attaching generic packet events.
         /// </summary>
         /// <param name="onReceive">Delegate to be added</param>
-        /// <exception cref="NullReferenceException">No socket io client</exception>
-        /// <exception cref="ModemNotConnectedException">If modem is not connected to the tetronet</exception>
-        /// <exception cref="NullAddressException">If there's no address in this modem</exception>
-        /// <exception cref="NotImplementedException">idk how to implement that</exception>
         internal void InternalAttachReceiveEvent(Action<Packet, Action> onReceive)
         {
             InternalPacketEvents += onReceive;

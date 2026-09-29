@@ -18,7 +18,8 @@
             uint cid,
             bool errored,
             ulong pid,
-            ulong mid)
+            ulong mid,
+            ushort rtp)
         {
             Receiver = rx;
             Transmitter = tx;
@@ -29,6 +30,7 @@
             IsErrorWhileReading = errored;
             PacketNo = pid;
             MessageId = mid;
+            RoutersToPass = rtp;
         }
         /// <summary>
         /// TetroNet subscriber address, that transmitted this instance of packet.
@@ -70,7 +72,10 @@
         /// ID of message, that this packet belongs to.
         /// </summary>
         public ulong MessageId = 0;
-
+        /// <summary>
+        /// Max routers to pass.
+        /// </summary>
+        public ushort RoutersToPass = 65535;
         public class Static
         {
             /// <summary>
@@ -80,7 +85,7 @@
             /// <summary>
             /// Represents a packet, that had one or more errors to occur during receiving process.
             /// </summary>
-            public static readonly Packet ErroredPacket = new(new(), new(), [], false, null, "", 0, true, 0, 0);
+            public static readonly Packet ErroredPacket = new(new(), new(), [], false, null, "", 0, true, 0, 0, 0);
         }
     }
 }

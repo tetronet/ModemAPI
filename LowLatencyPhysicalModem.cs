@@ -474,7 +474,7 @@ namespace ModemAPI
         /// <param name="packetSize">Max amount of bytes in a single packet in a packet queue</param>
         /// <param name="delay">Delay between transmitting each packet in the queue, useful for overloaded/slow network</param>
         /// <exception cref="NullAddressException">Happens when transmitting modem does not have any tetronet address</exception>
-        public void Transmit(byte[] data, Address address, string queryType, uint connectionId, string? metadata = null, ushort packetSize = 1024, int delay = 0)
+        public void Transmit(byte[] data, Address address, string queryType, uint connectionId, string? metadata = null, ushort packetSize = 1024, int delay = 0, ushort ttl = 65535)
         {
             if (LocalModemAddress == null)
             {
@@ -494,14 +494,15 @@ namespace ModemAPI
                     Receiver = address,
                     Transmitter = LocalModemAddress,
                     PacketNo = (byte)(i / packetSize),
-                    MessageId = mid
+                    MessageId = mid,
+                    RoutersToPass = ttl
                 };
                 Transmit(packet);
                 Thread.Sleep(delay);
             }
         }
 
-        public void LowLevelTransmit(byte[] data, Address address, string qt, uint cid, string? metadata)
+        public void LowLevelTransmit(byte[] data, Address address, string qt, uint cid, string? metadata, ushort ttl = 65535)
         {
             if (LocalModemAddress == null)
             {
@@ -517,6 +518,7 @@ namespace ModemAPI
             packet.Metadata = metadata;
             packet.DataBytes = data;
             packet.IsLastInSequence = true;
+            packet.RoutersToPass = ttl;
             Transmit(packet);
         }
 
@@ -531,7 +533,7 @@ namespace ModemAPI
         /// <param name="packetSize">Max amount of bytes in a single packet in a packet queue</param>
         /// <param name="delay">Delay between transmitting each packet in the queue, useful for overloaded/slow network</param>
         /// <exception cref="NullAddressException">Happens when transmitting modem does not have any tetronet address</exception>
-        public void Transmit(string data, Address address, string queryType, uint connectionId, string? metadata = null, ushort packetSize = 1024, int delay = 0)
+        public void Transmit(string data, Address address, string queryType, uint connectionId, string? metadata = null, ushort packetSize = 1024, int delay = 0, ushort ttl = 65535)
         {
             if (LocalModemAddress == null)
             {
@@ -551,7 +553,8 @@ namespace ModemAPI
                     Receiver = address,
                     Transmitter = LocalModemAddress,
                     PacketNo = (byte)(i / packetSize),
-                    MessageId = mid
+                    MessageId = mid,
+                    RoutersToPass = ttl
                 };
                 //Console.WriteLine("the value at line 258 is : " + (i + packetSize) + " and packet estimated packsize will be : " + packetSize);
                 //Console.WriteLine("the value at line 259 is : " + new string(data.ToCharArray().Skip(i).Take(packetSize).ToArray()));

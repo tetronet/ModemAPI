@@ -48,6 +48,7 @@ namespace ModemAPI
             packet.Metadata = message.metadata;
             packet.PacketNo = (byte)message.package_info.package_no;
             packet.MessageId = (ulong)message.package_info.message_id;
+            packet.RoutersToPass = message.package_info.max_hops ?? 65535;
             return packet;
         }
 
@@ -65,13 +66,14 @@ namespace ModemAPI
             {
                 throw new NullAddressException("transmitter address null");
             }
-            message.package_info.to = packet.Receiver.AddressValue.Split('-').Cast<object>().ToList();
-            message.package_info.from = packet.Transmitter.AddressValue.Split('-').Cast<object>().ToList();
+            message.package_info.to = [.. packet.Receiver.AddressValue.Split('-').Cast<object>()];
+            message.package_info.from = [.. packet.Transmitter.AddressValue.Split('-').Cast<object>()];
             message.package_info.is_last_in_package_queue = packet.IsLastInSequence;
             message.package_info.connectionid = packet.ConnectionID;
             message.package_info.package_type = packet.QueryType;
             message.package_info.package_no = packet.PacketNo;
             message.package_info.message_id = packet.MessageId;
+            message.package_info.max_hops = packet.RoutersToPass;
             return message;
         }
 
@@ -87,7 +89,6 @@ namespace ModemAPI
             return Encoding.UTF8.GetString(base64EncodedBytes);
         }
 
-        // todo: add support for new message id thing
         public static Packet BytesToPacket(byte[] bytes_)
         {
             ReadOnlySpan<byte> bytes = bytes_;
@@ -131,6 +132,9 @@ namespace ModemAPI
                 // Get packet message id
                 ulong messageId_ = BinaryPrimitives.ReadUInt64BigEndian(bytes.Slice(offset));
                 offset += 8;
+                // Get packet TTL
+                ushort ttl_ = BinaryPrimitives.ReadUInt16BigEndian(bytes.Slice(offset));
+                offset += 2;
                 // Get data for packet
                 ushort packetDataLength = BinaryPrimitives.ReadUInt16BigEndian(bytes.Slice(offset));
                 offset += 2;
@@ -178,6 +182,7 @@ namespace ModemAPI
                 prepare.Metadata = packetMetadata_;
                 prepare.PacketNo = transmissionNo_;
                 prepare.MessageId = messageId_;
+                prepare.RoutersToPass = ttl_;
                 success = true;
                 ModemAPIDebugger.OutputDebugMessage("==== [at PacketConverter.cs at line 170] ====");
                 ModemAPIDebugger.PrintOutPacket(prepare);
@@ -233,6 +238,11 @@ namespace ModemAPI
             Span<byte> mid = stackalloc byte[8];
             BinaryPrimitives.WriteUInt64BigEndian(mid, packet.MessageId);
             buffer.AddRange(mid);
+
+            // ttl
+            Span<byte> ttl = stackalloc byte[2];
+            BinaryPrimitives.WriteUInt16BigEndian(ttl, packet.RoutersToPass);
+            buffer.AddRange(ttl);
 
             // Data
             if (packet.DataBytes.Length > ushort.MaxValue)
