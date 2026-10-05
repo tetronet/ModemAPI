@@ -39,6 +39,10 @@ namespace ModemAPI
             return AddressValue ?? "";
         }
 
+        public static bool IsNull(Address address)
+        {
+            return address == null || address.AddressValue == null;
+        }
         public override int GetHashCode()
         {
             return HashCode.Combine(AddressValue);

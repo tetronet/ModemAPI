@@ -11,6 +11,7 @@ namespace ModemAPI
         public long Id;
         public long TimeStamp;
         public byte[]? Data;
+        public int RetransmissionCounter = 0;
 
         public ReliablePacketInformation()
         {

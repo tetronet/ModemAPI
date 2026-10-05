@@ -1,6 +1,7 @@
 ﻿using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.ComponentModel;
+using System.IO;
 using System.Text;
 
 namespace ModemAPI
@@ -35,6 +36,7 @@ namespace ModemAPI
         /// </summary>
         public event Action<Address, uint> SRTPClientReceived = delegate { };
         public bool SrtpEnablePacketLossBasedRateLimiter = false;
+        public event Action<Address, uint> SRTPClientTransmitTimedOut = delegate { };
         /// <summary>
         /// Creates a new instance of LMDTPServer.
         /// </summary>
@@ -72,6 +74,7 @@ namespace ModemAPI
                         SRTPClient temp = new(BaseModem, p.Transmitter, "lm_tunnel", p.ConnectionID, SrtpTimeout);
                         temp.PacketLossBasedCongestionControl = SrtpEnablePacketLossBasedRateLimiter;
                         temp.TicksPacketDelay = SrtpRateLimiting;
+                        temp.RetransmissionsBeforeConsideringRemoteSideDead = 10;
                         temp.OnError += delegate (int code, string desc)
                         {
                             ErrorOccured(new Exception($"SRTP ERRNO {code}: {desc}"));
@@ -117,6 +120,7 @@ namespace ModemAPI
             {
                 if (Clients.TryGetValue((transmitter, connectid), out SRTPClient? tempClient))
                 {
+                    Stream? stream = null;
                     try
                     {
                         //tempClient.OnAckReceived += delegate (long p) { Console.WriteLine("ack lmdtp server"); };
@@ -137,7 +141,7 @@ namespace ModemAPI
                             return;
                         }
                         // send the response
-                        Stream? stream = ResourceProvider?.GetResource(resourceName);
+                        stream = ResourceProvider?.GetResource(resourceName);
                         if (stream == null)
                         {
                             tempClient.Transmit(ConstructResponseHeader(LMDTPResponseFlags.ServerSideError, 0, new byte[64]));
@@ -172,9 +176,31 @@ namespace ModemAPI
                         Clients.TryRemove((transmitter, connectid), out _);
                         //Console.WriteLine("And now there's clients: " + Clients.Count);
                     }
+                    catch (OperationCanceledException)
+                    {
+                        tempClient.Close();
+                        Clients.TryRemove((transmitter, connectid), out _);
+                        SRTPClientTransmitTimedOut(transmitter, connectid);
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        tempClient.Close();
+                        Clients.TryRemove((transmitter, connectid), out _);
+                        SRTPClientTransmitTimedOut(transmitter, connectid);
+                    }
+                    catch (TimeoutException)
+                    {
+                        tempClient.Close();
+                        Clients.TryRemove((transmitter, connectid), out _);
+                        SRTPClientTransmitTimedOut(transmitter, connectid);
+                    }
                     catch (Exception ex)
                     {
                         ErrorOccured(ex);
+                    }
+                    finally
+                    {
+                        stream?.Dispose();
                     }
                 }
                 else

@@ -18,6 +18,7 @@ namespace ModemAPI
         private ConcurrentDictionary<long, byte[]> ReorderingBuffer = new ConcurrentDictionary<long, byte[]>();
         private ConcurrentDictionary<long, ReliablePacketInformation> InternalState = new ConcurrentDictionary<long, ReliablePacketInformation>();
         private long InternalPacketTimer = 0;
+        private bool FailedDueToTooManyRetxAttepms = false;
         private volatile bool IsThrottled = false;
         /// <summary>
         /// Gets called for each received message by this client, and data of this message is sent to the event handler.
@@ -63,7 +64,22 @@ namespace ModemAPI
         /// Gets the remote address, which this SRTP client is currently communicating with.
         /// </summary>
         public Address RemoteServer { get { return Address.Copy(CommunicatingWith); } }
+        /// <summary>
+        /// Gets the Connection ID, which this SRTP client is currently using for tetronet communication.
+        /// </summary>
         public uint EndPointConnectionID { get { return ConnectionID; } }
+        /// <summary>
+        /// Time out in Ticks, for how long this instance of SRTPClient will wait for a free slot in InternalState.
+        /// </summary>
+        public int TransmitTimeOutInTicks = 600000000;
+        /// <summary>
+        /// How many retransmissions will any of the packets need to cause the remote side being considered dead and when Transmit(byte[]) method will throw an exception.
+        /// </summary>
+        public int RetransmissionsBeforeConsideringRemoteSideDead = 100;
+        /// <summary>
+        /// Milliseconds to pause on packet loss if <see cref="PacketLossBasedCongestionControl"/> is set to <see langword="true"/>
+        /// </summary>
+        public int ThrottleTime = 2000;
         public long MissingPacket
         {
             get
@@ -91,7 +107,7 @@ namespace ModemAPI
             {
                 if (packet.ConnectionID != ConnectionID || packet.QueryType != QueryType)
                 {
-                    Console.WriteLine("SRTPClient MISMATCH CID OR QT!!!!!!!!!");
+                    ModemAPIDebugger.OutputDebugMessage("SRTPClient MISMATCH CID OR QT!!!!!!!!!");
                     return;
                 }
                 try
@@ -142,6 +158,14 @@ namespace ModemAPI
                                 UnivSend(info.Data);
                                 // update timeout
                                 info.UpdateTimeStamp();
+                                // check the counter
+                                if (info.RetransmissionCounter > RetransmissionsBeforeConsideringRemoteSideDead)
+                                {
+                                    FailedDueToTooManyRetxAttepms = true;
+                                    Close();
+                                }
+                                // update retx counter
+                                info.RetransmissionCounter++;
                                 // if enabled, pause the transmission
                                 if (PacketLossBasedCongestionControl)
                                 {
@@ -150,7 +174,7 @@ namespace ModemAPI
                                         if (!IsThrottled)
                                         {
                                             IsThrottled = true;
-                                            Thread.Sleep(2000);
+                                            Thread.Sleep(ThrottleTime);
                                             IsThrottled = false;
                                         }
                                     });
@@ -232,13 +256,36 @@ namespace ModemAPI
         }
         public void Transmit(byte[] data)
         {
+            if (IsClosed)
+            {
+                throw new InvalidOperationException("This client is in an invalid state \"Closed\". To transmit data, it must be in state \"Opened\"");
+            }
+            if (FailedDueToTooManyRetxAttepms)
+            {
+                Close();
+                throw new OperationCanceledException("Client was cancelled by the retransmission thread: too many retransmission attempts.");
+            }
             if (data.Length > 59992 || data.Length == 0)
             {
                 throw new ArgumentOutOfRangeException(nameof(data), "data must contain not more than 59992 bytes and not less than 1 byte");
             }
+            long start = Stopwatch.GetTimestamp();
             while (InternalState.Count > MaxUnackedPackets)
             {
                 OnError(-1885, "Pending for acknowledgement packets storage is full");
+                if (Stopwatch.GetElapsedTime(start) > TimeSpan.FromTicks(TransmitTimeOutInTicks))
+                {
+                    throw new TimeoutException("Transmit timed out. Normally this will mean that the remote side is dead and you want to Close() this SRTPClient.");
+                }
+                if (IsClosed)
+                {
+                    throw new InvalidOperationException("This client is in an invalid state \"Closed\". To transmit data, it must be in state \"Opened\"");
+                }
+                if (FailedDueToTooManyRetxAttepms)
+                {
+                    Close();
+                    throw new OperationCanceledException("Client was cancelled by the retransmission thread: too many retransmission attempts.");
+                }
                 Thread.Sleep(100);
             }
             while (IsThrottled)
