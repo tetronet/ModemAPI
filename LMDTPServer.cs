@@ -38,6 +38,10 @@ namespace ModemAPI
         public bool SrtpEnablePacketLossBasedRateLimiter = false;
         public event Action<Address, uint> SRTPClientTransmitTimedOut = delegate { };
         /// <summary>
+        /// Gets invoked on each successfully asnwered request, and you will get the address and the connection ID of the client completed.
+        /// </summary>
+        public event Action<Address, uint> RequestSuccessfullyProcessed = delegate { };
+        /// <summary>
         /// Creates a new instance of LMDTPServer.
         /// </summary>
         /// <param name="baseModem">Modem, that will be used by the server to communicate with the Tetronet</param>
@@ -175,6 +179,7 @@ namespace ModemAPI
                         tempClient.Close();
                         Clients.TryRemove((transmitter, connectid), out _);
                         //Console.WriteLine("And now there's clients: " + Clients.Count);
+                        RequestSuccessfullyProcessed(transmitter, connectid);
                     }
                     catch (OperationCanceledException)
                     {
