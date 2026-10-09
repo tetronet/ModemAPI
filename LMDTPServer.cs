@@ -154,7 +154,7 @@ namespace ModemAPI
                             ErrorOccured(new ArgumentNullException(nameof(stream), "Resource Provider must return a valid non-null stream object"));
                             return;
                         }
-                        tempClient.Transmit(ConstructResponseHeader(ResourceProvider?.GetResourсeResponseFlags(resourceName), ResourceProvider?.GetResourceSize(resourceName), ResourceProvider?.GetResourceSha512Hashsum(resourceName)));
+                        tempClient.Transmit(ConstructResponseHeader(ResourceProvider?.GetResourceResponseFlags(resourceName), ResourceProvider?.GetResourceSize(resourceName), ResourceProvider?.GetResourceSha512Hashsum(resourceName)));
                         Span<byte> packetBuffer = new byte[PacketMaxLength];
                         byte[] buffer = new byte[PacketMaxLength];
                         int bytesRead;

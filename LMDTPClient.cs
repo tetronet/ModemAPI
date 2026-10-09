@@ -69,7 +69,6 @@ namespace ModemAPI
             // 2 bytes length of the remote resource name
             // 0-65535 bytes remote resource name
             // 8 bytes maximum amount of bytes, that we could download
-            Console.WriteLine(UnderlyingClient.OnMessageReceived?.GetInvocationList().Length);
             try
             {
                 if (IsClosed)

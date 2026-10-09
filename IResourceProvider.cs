@@ -11,6 +11,6 @@ namespace ModemAPI
         Stream GetResource(string resourceName);
         long GetResourceSize(string resourceName);
         byte[] GetResourceSha512Hashsum(string resourceName);
-        LMDTPResponseFlags GetResourсeResponseFlags(string resourceName);
+        LMDTPResponseFlags GetResourceResponseFlags(string resourceName);
     }
 }
