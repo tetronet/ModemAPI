@@ -71,7 +71,7 @@ namespace ModemAPI
                 {
                     if (CheckGrayList(p.Transmitter))
                     {
-                        if (Clients.ContainsKey((p.Transmitter, p.ConnectionID)) || BinaryPrimitives.ReadUInt16BigEndian(p.DataBytes) != LMDTPClient.LMDTP_REQUEST_PREFIX || (ConnectionIDRangeStart > p.ConnectionID && p.ConnectionID > ConnectionIDRangeEnd))
+                        if (Clients.ContainsKey((p.Transmitter, p.ConnectionID)) || BinaryPrimitives.ReadUInt16BigEndian(p.DataBytes) != LMDTPClient.LMDTP_REQUEST_PREFIX || ConnectionIDRangeStart > p.ConnectionID || p.ConnectionID > ConnectionIDRangeEnd)
                         {
                             return;
                         }
@@ -154,7 +154,7 @@ namespace ModemAPI
                             ErrorOccured(new ArgumentNullException(nameof(stream), "Resource Provider must return a valid non-null stream object"));
                             return;
                         }
-                        tempClient.Transmit(ConstructResponseHeader(LMDTPResponseFlags.Success, ResourceProvider?.GetResourceSize(resourceName), ResourceProvider?.GetResourceSha512Hashsum(resourceName)));
+                        tempClient.Transmit(ConstructResponseHeader(ResourceProvider?.GetResourseResponseFlags(resourceName), ResourceProvider?.GetResourceSize(resourceName), ResourceProvider?.GetResourceSha512Hashsum(resourceName)));
                         Span<byte> packetBuffer = new byte[PacketMaxLength];
                         byte[] buffer = new byte[PacketMaxLength];
                         int bytesRead;
