@@ -14,7 +14,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("ModemAPI")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+2952c1f702cdae50db1c29bf55fb513ef0a2a48a")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+cfccecd8dc82dbabaeb1a4584969e87daf1486ac")]
 [assembly: System.Reflection.AssemblyProductAttribute("ModemAPI")]
 [assembly: System.Reflection.AssemblyTitleAttribute("ModemAPI")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

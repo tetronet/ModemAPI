@@ -105,6 +105,10 @@ namespace ModemAPI
             // receiver task
             Modem.AttachReceiveEventNoUnfragment(delegate (Packet packet, Action k)
             {
+                if (IsClosed)
+                {
+                    return;
+                }
                 if (packet.ConnectionID != ConnectionID || packet.QueryType != QueryType)
                 {
                     ModemAPIDebugger.OutputDebugMessage("SRTPClient MISMATCH CID OR QT!!!!!!!!!");
@@ -302,7 +306,10 @@ namespace ModemAPI
         public void Close()
         {
             IsClosed = true;
+            ReorderingBuffer.Clear();
+            ReceivedNumbers.Clear();
             InternalState.Clear();
+            OnMessageReceived = delegate { };
         }
         public bool WasPacketReceived(long packno)
         {
