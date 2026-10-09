@@ -71,7 +71,7 @@ namespace ModemAPI
                 {
                     if (CheckGrayList(p.Transmitter))
                     {
-                        if (Clients.ContainsKey((p.Transmitter, p.ConnectionID)) || BinaryPrimitives.ReadUInt16BigEndian(p.DataBytes) != LMDTPClient.LMDTP_REQUEST_PREFIX)
+                        if (Clients.ContainsKey((p.Transmitter, p.ConnectionID)) || BinaryPrimitives.ReadUInt16BigEndian(p.DataBytes) != LMDTPClient.LMDTP_REQUEST_PREFIX || (ConnectionIDRangeStart < p.ConnectionID && p.ConnectionID < ConnectionIDRangeEnd))
                         {
                             return;
                         }
