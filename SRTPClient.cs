@@ -80,6 +80,7 @@ namespace ModemAPI
         /// Milliseconds to pause on packet loss if <see cref="PacketLossBasedCongestionControl"/> is set to <see langword="true"/>
         /// </summary>
         public int ThrottleTime = 2000;
+        public event Action<SRTPClient> OnClose = delegate { };
         public long MissingPacket
         {
             get
@@ -124,7 +125,7 @@ namespace ModemAPI
                         return;
                     }
                     long id = BinaryPrimitives.ReadInt64BigEndian(dataReceived);
-                    
+
                     if (dataReceived.Length == 8)
                     {
                         // == ack receiver ==
@@ -310,6 +311,7 @@ namespace ModemAPI
             ReceivedNumbers.Clear();
             InternalState.Clear();
             OnMessageReceived = delegate { };
+            OnClose(this);
         }
         public bool WasPacketReceived(long packno)
         {

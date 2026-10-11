@@ -2,7 +2,9 @@
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.IO;
+using System.Security.Cryptography;
 using System.Text;
+using System.Xml;
 
 namespace ModemAPI
 {
@@ -40,7 +42,7 @@ namespace ModemAPI
         /// <summary>
         /// Gets invoked on each successfully asnwered request, and you will get the address and the connection ID of the client completed.
         /// </summary>
-        public event Action<Address, uint> RequestSuccessfullyProcessed = delegate { };
+        public event Action<Address, uint, string> RequestSuccessfullyProcessed = delegate { };
         /// <summary>
         /// Creates a new instance of LMDTPServer.
         /// </summary>
@@ -136,6 +138,7 @@ namespace ModemAPI
                         }
                         ushort resourceNameLength = BinaryPrimitives.ReadUInt16BigEndian(bytes[2..]);
                         string resourceName = Encoding.UTF8.GetString(bytes.Slice(4, resourceNameLength));
+                        LMDTPRequestType requestType = (LMDTPRequestType)bytes[2 + 2 + resourceNameLength + 8];
                         if (ResourceProvider?.GetResourceSize(resourceName) > BinaryPrimitives.ReadInt64BigEndian(bytes[(2 + 2 + resourceNameLength)..]))
                         {
                             tempClient.Transmit(ConstructResponseHeader(LMDTPResponseFlags.LargeMessageExceededMTU, 0, new byte[64]));
@@ -145,41 +148,56 @@ namespace ModemAPI
                             return;
                         }
                         // send the response
-                        stream = ResourceProvider?.GetResource(resourceName);
-                        if (stream == null)
+                        switch (requestType)
                         {
-                            tempClient.Transmit(ConstructResponseHeader(LMDTPResponseFlags.ServerSideError, 0, new byte[64]));
-                            tempClient.Close();
-                            Clients.TryRemove((transmitter, connectid), out _);
-                            ErrorOccured(new ArgumentNullException(nameof(stream), "Resource Provider must return a valid non-null stream object"));
-                            return;
-                        }
-                        tempClient.Transmit(ConstructResponseHeader(ResourceProvider?.GetResourceResponseFlags(resourceName), ResourceProvider?.GetResourceSize(resourceName), ResourceProvider?.GetResourceSha512Hashsum(resourceName)));
-                        Span<byte> packetBuffer = new byte[PacketMaxLength];
-                        byte[] buffer = new byte[PacketMaxLength];
-                        int bytesRead;
-                        while ((bytesRead = stream.Read(buffer, 0, buffer.Length)) > 0)
-                        {
-                            if (bytesRead < buffer.Length)
-                            {
-                                // last chunk can be not full
-                                byte[] lastChunk = new byte[bytesRead];
-                                Array.Copy(buffer, lastChunk, bytesRead);
-                                tempClient.Transmit(lastChunk);
-                            }
-                            else
-                            {
-                                tempClient.Transmit(buffer);
-                            }
+                            case LMDTPRequestType.Obtain:
+                                stream = ResourceProvider?.GetResource(resourceName);
+                                if (stream == null)
+                                {
+                                    tempClient.Transmit(ConstructResponseHeader(LMDTPResponseFlags.ServerSideError, 0, new byte[64]));
+                                    tempClient.Close();
+                                    Clients.TryRemove((transmitter, connectid), out _);
+                                    ErrorOccured(new ArgumentNullException(nameof(stream), "Resource Provider must return a valid non-null stream object"));
+                                    return;
+                                }
+                                tempClient.Transmit(ConstructResponseHeader(ResourceProvider?.GetResourceResponseFlags(resourceName), ResourceProvider?.GetResourceSize(resourceName), ResourceProvider?.GetResourceSha512Hashsum(resourceName)));
+                                Span<byte> packetBuffer = new byte[PacketMaxLength];
+                                byte[] buffer = new byte[PacketMaxLength];
+                                int bytesRead;
+                                while ((bytesRead = stream.Read(buffer, 0, buffer.Length)) > 0)
+                                {
+                                    if (bytesRead < buffer.Length)
+                                    {
+                                        // last chunk can be not full
+                                        byte[] lastChunk = new byte[bytesRead];
+                                        Array.Copy(buffer, lastChunk, bytesRead);
+                                        tempClient.Transmit(lastChunk);
+                                    }
+                                    else
+                                    {
+                                        tempClient.Transmit(buffer);
+                                    }
+                                }
+                                break;
+                            case LMDTPRequestType.Hash:
+                                byte[]? hash = ResourceProvider?.GetResourceSha512Hashsum(resourceName);
+                                if (hash == null)
+                                {
+                                    break;
+                                }
+                                byte[] hashhash = SHA512.HashData(hash);
+                                tempClient.Transmit(ConstructResponseHeader(ResourceProvider?.GetResourceResponseFlags(resourceName), 64, hashhash));
+                                tempClient.Transmit(hash);
+                                break;
                         }
                         // close this client
                         //Console.WriteLine("Currently there are clients: " + Clients.Count);
                         //Console.WriteLine("LMDTP server closed");
-                        stream.Dispose();
+                        stream?.Dispose();
                         tempClient.Close();
                         Clients.TryRemove((transmitter, connectid), out _);
                         //Console.WriteLine("And now there's clients: " + Clients.Count);
-                        RequestSuccessfullyProcessed(transmitter, connectid);
+                        RequestSuccessfullyProcessed(transmitter, connectid, resourceName);
                     }
                     catch (OperationCanceledException)
                     {

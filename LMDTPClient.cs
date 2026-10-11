@@ -62,7 +62,7 @@ namespace ModemAPI
         /// <param name="remoteResourceName">Remote resource name to obtain</param>
         /// <param name="maxDownloadBytes">Limit how much you want to server to send you, if the resourse is longer, the server will return an error and the client will throw an exception</param>
         /// <param name="ticksTimeout">How much ticks this request can wait without packets before throwing <see cref="TimeoutException"/></param>
-        public void Request(Stream destination, string remoteResourceName, long maxDownloadBytes, int ticksTimeout = 50000000)
+        public void Request(Stream destination, string remoteResourceName, long maxDownloadBytes, int ticksTimeout = 50000000, LMDTPRequestType rqType = LMDTPRequestType.Obtain)
         {
             // format:
             // 2 bytes prefix
@@ -81,11 +81,12 @@ namespace ModemAPI
                 {
                     throw new ArgumentOutOfRangeException(nameof(remoteResourceName), "the length of resource name after converting it into the UTF-8 must not exceed 65535 bytes");
                 }
-                Span<byte> request = new byte[2 + 2 + resourceNameByteLength + 8];
+                Span<byte> request = new byte[2 + 2 + resourceNameByteLength + 8 + 1];
                 BinaryPrimitives.WriteUInt16BigEndian(request, LMDTP_REQUEST_PREFIX); // protocol prefix
                 BinaryPrimitives.WriteUInt16BigEndian(request[2..], (ushort)resourceNameByteLength); // length of the resource name
                 Encoding.UTF8.GetBytes(remoteResourceName, request[4..]);
-                BinaryPrimitives.WriteInt64BigEndian(request[^8..], maxDownloadBytes);
+                BinaryPrimitives.WriteInt64BigEndian(request[^9..], maxDownloadBytes);
+                request[^1] = (byte)rqType;
                 IsReceivingData = true;
                 IsFirstPacket = true;
                 UnderlyingClient.OnMessageReceived += SRTPDataEvent;
