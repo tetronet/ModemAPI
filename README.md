@@ -48,6 +48,13 @@ modem.AttachReceiveEvent(delegate (DataBlock remoteMessage, Action obsolete)
 });
 ```
 
+### Protocols
+LL-CIoCIL-mini - Low Latency Copybook Internet over Copybook Internet Lines mini\
+CENP - Copybook Exchange Network Protocol\
+LMDTP - Large Message Direct Tunnel Protocol\
+SRTP - Simple Reliable Transmission Protocol\
+These are the protocols you actually want to know about, other protocols in this library are legacy/not used.
+
 ### Things you'll need to do
 1) Install doghappy's SocketIOClient library
 2) Install System.IO.Ports library
