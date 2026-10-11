@@ -14,6 +14,10 @@
         /// </summary>
         public static readonly char[] PrintableCharactersQueryType = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:=~?!._-".ToCharArray();
         /// <summary>
+        /// Limited Printable Charachers (used for Address).
+        /// </summary>
+        public static readonly char[] PrintableCharactersAddress = "0123456789-".ToCharArray();
+        /// <summary>
         /// Verifies the character for being illegal in Standart List.
         /// </summary>
         /// <param name="c">Character for verifying</param>
@@ -26,16 +30,9 @@
         {
             return !PrintableCharactersQueryType.Contains(c);
         }
-        public static bool IsStringWrong(string s, bool isLimitedSet)
+        public static bool IsCharacterWrongAddress(char c)
         {
-            for (int i = 0; i < s.Length; i++)
-            {
-                if (!(isLimitedSet ? PrintableCharactersQueryType : PrintableCharacters).Contains(s[i]))
-                {
-                    return false;
-                }
-            }
-            return true;
+            return !PrintableCharactersAddress.Contains(c);
         }
     }
 }
