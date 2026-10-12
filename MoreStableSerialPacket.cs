@@ -7,7 +7,7 @@ namespace ModemAPI
     public class MoreStableSerialPacket : ISerialPacket
     {
         private Stream io;
-        private readonly object _writeLock = new object();
+        private readonly Lock _writeLock = new();
         private Action<byte[], Action> OnReceive = delegate { };
         public event Action<L1DropBytesReasons, int> OnDataDropped = delegate { };
         public event Action MalformedPacketReceived = delegate { };
@@ -18,7 +18,8 @@ namespace ModemAPI
         public MoreStableSerialPacket(Stream io)
         {
             this.io = io;
-            TextReader textReader = new StreamReader(io);
+            StreamReader textReader = new(io);
+            io.ReadTimeout = Timeout.Infinite;
             Task.Run(delegate ()
             {
                 while (true)
