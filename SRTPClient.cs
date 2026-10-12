@@ -19,7 +19,7 @@ namespace ModemAPI
         private ConcurrentDictionary<long, ReliablePacketInformation> InternalState = new ConcurrentDictionary<long, ReliablePacketInformation>();
         private long InternalPacketTimer = 0;
         private bool FailedDueToTooManyRetxAttepms = false;
-        private volatile bool IsThrottled = false;
+        private double ThrottlingPower = 1;
         /// <summary>
         /// Gets called for each received message by this client, and data of this message is sent to the event handler.
         /// </summary>
@@ -47,11 +47,11 @@ namespace ModemAPI
         /// <summary>
         /// How many packets can stand in the send, but unacked state.
         /// </summary>
-        public int MaxUnackedPackets = 10000;
+        public int MaxUnackedPackets = 1024;
         /// <summary>
         /// How deep into the future packets will be received.
         /// </summary>
-        public int MaxPacketNoFromFuture = 10000;
+        public int MaxPacketNoFromFuture = 1024;
         /// <summary>
         /// Delay in Ticks (each tick is 100 ns) between Universal Packet Sends.
         /// </summary>
@@ -131,6 +131,10 @@ namespace ModemAPI
                         // == ack receiver ==
                         InternalState.TryRemove(id, out _);
                         OnAckReceived(id);
+                        if (PacketLossBasedCongestionControl)
+                        {
+                            ThrottlingPower = Math.Clamp(ThrottlingPower + 1.001, 0.1, 1);
+                        }
                     }
                     if (dataReceived.Length > 8)
                     {
@@ -174,15 +178,7 @@ namespace ModemAPI
                                 // if enabled, pause the transmission
                                 if (PacketLossBasedCongestionControl)
                                 {
-                                    _ = Task.Run(delegate ()
-                                    {
-                                        if (!IsThrottled)
-                                        {
-                                            IsThrottled = true;
-                                            Thread.Sleep(ThrottleTime);
-                                            IsThrottled = false;
-                                        }
-                                    });
+                                    ThrottlingPower = Math.Clamp(ThrottlingPower / 2, 0.1, 1);
                                 }
                                 // call the user event
                                 OnRetransmit(info.Id);
@@ -275,9 +271,9 @@ namespace ModemAPI
                 throw new ArgumentOutOfRangeException(nameof(data), "data must contain not more than 59992 bytes and not less than 1 byte");
             }
             long start = Stopwatch.GetTimestamp();
-            while (InternalState.Count > MaxUnackedPackets)
+            while (InternalState.Count > MaxUnackedPackets * ThrottlingPower)
             {
-                OnError(-1885, "Pending for acknowledgement packets storage is full");
+                //OnError(-1885, "Pending for acknowledgement packets storage is full");
                 if (Stopwatch.GetElapsedTime(start) > TimeSpan.FromTicks(TransmitTimeOutInTicks))
                 {
                     throw new TimeoutException("Transmit timed out. Normally this will mean that the remote side is dead and you want to Close() this SRTPClient.");
@@ -292,10 +288,6 @@ namespace ModemAPI
                     throw new OperationCanceledException("Client was cancelled by the retransmission thread: too many retransmission attempts.");
                 }
                 Thread.Sleep(100);
-            }
-            while (IsThrottled)
-            {
-                Thread.Sleep(50);
             }
             byte[] data_ = new byte[data.Length + 8];
             BinaryPrimitives.WriteInt64BigEndian(data_.AsSpan(), SequentialPacketNumber);

@@ -8,7 +8,7 @@ namespace ModemAPI
 {
     public interface IResourceProvider
     {
-        Stream GetResource(string resourceName);
+        Stream? GetResource(string resourceName);
         long GetResourceSize(string resourceName);
         byte[] GetResourceSha512Hashsum(string resourceName);
         LMDTPResponseFlags GetResourceResponseFlags(string resourceName);

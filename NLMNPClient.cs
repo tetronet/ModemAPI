@@ -11,6 +11,7 @@ namespace ModemAPI
         private bool IsListening = false;
         private bool IsClosed = false;
         public event Action<Address, string> OnNotificationReceived = delegate { };
+        public event Action<Exception> OnErrorReceived = delegate { };
         /// <summary>
         /// Create a new instance of NLMNP Client.
         /// </summary>
@@ -29,16 +30,23 @@ namespace ModemAPI
             {
                 Modem.AttachReceiveEventNoUnfragment(delegate (Packet packet, Action obsolete)
                 {
-                    if (IsClosed)
+                    try
                     {
-                        return;
+                        if (IsClosed)
+                        {
+                            return;
+                        }
+                        if (packet.ConnectionID == 4000000015 && packet.QueryType == "lm_notify")
+                        {
+                            string[] data = Encoding.UTF8.GetString(packet.DataBytes).Split('@');
+                            Address serverWithLargeMessage = new(data[1]);
+                            string largeMessageName = data[0];
+                            OnNotificationReceived(serverWithLargeMessage, largeMessageName);
+                        }
                     }
-                    if (packet.ConnectionID == 4000000015 && packet.QueryType == "lm_notify")
+                    catch (Exception ex)
                     {
-                        string[] data = Encoding.UTF8.GetString(packet.DataBytes).Split('@');
-                        Address serverWithLargeMessage = new(data[1]);
-                        string largeMessageName = data[0];
-                        OnNotificationReceived(serverWithLargeMessage, largeMessageName);
+                        OnErrorReceived(ex);
                     }
                 });
             }

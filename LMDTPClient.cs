@@ -25,9 +25,12 @@ namespace ModemAPI
         private long TimestampRequestSent = 0;
         private byte[] SHA512Received = new byte[64];
         private long CurrentDownloadBytesInternal = 0;
+        private long TotalDownloadBytesInternal = 0;
         private bool IsClosed = false;
         private Stream? CurrentDestinationStream = null;
+        private IncrementalHash hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA512);
         public long CurrentDownloadBytes { get { return CurrentDownloadBytesInternal; } }
+        public long TotalDownloadBytes { get { return TotalDownloadBytesInternal; } }
         public LMDTPClient(IModem baseModem, Address dest, uint cid, int srtpTimeoutTicks)
         {
             UnderlyingClient = new(baseModem, dest, "lm_tunnel", cid, srtpTimeoutTicks);
@@ -171,18 +174,19 @@ namespace ModemAPI
                         SHA512Received = bytes.Slice(4, 64).ToArray();
                         // allocate data and read it
                         long dataLength = BinaryPrimitives.ReadInt64BigEndian(bytes[68..]);
-                        CurrentDestinationStream.SetLength(dataLength);
+                        TotalDownloadBytesInternal = dataLength;
                         CurrentDestinationStream.Write(bytes[76..]);
-
+                        hasher.AppendData(bytes[76..]);
                         IsFirstPacket = false;
                     }
                     else
                     {
                         CurrentDestinationStream.Write(bytes);
-                        if (CurrentDestinationStream.Position == CurrentDestinationStream.Length)
+                        hasher.AppendData(bytes);
+                        if (CurrentDestinationStream.Position == TotalDownloadBytes)
                         {
                             CurrentDestinationStream.Position = 0;
-                            if (SHA512.HashData(CurrentDestinationStream).SequenceEqual(SHA512Received))
+                            if (hasher.GetHashAndReset().SequenceEqual(SHA512Received))
                             {
                                 IsFirstPacket = true;
                                 IsReceivingData = false;
