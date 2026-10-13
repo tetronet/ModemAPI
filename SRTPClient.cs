@@ -133,7 +133,7 @@ namespace ModemAPI
                         OnAckReceived(id);
                         if (PacketLossBasedCongestionControl)
                         {
-                            ThrottlingPower = Math.Clamp(ThrottlingPower + 1.001, 0.1, 1);
+                            ThrottlingPower = Math.Clamp(ThrottlingPower + 0.01 * (1 - ThrottlingPower), 0.1, 1);
                         }
                     }
                     if (dataReceived.Length > 8)
