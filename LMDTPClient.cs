@@ -22,7 +22,7 @@ namespace ModemAPI
         public event Action<Exception> ErrorOccured = delegate { };
         private bool IsReceivingData = false;
         private bool IsFirstPacket = true;
-        private long TimestampRequestSent = 0;
+        private long TimestampLastPacket = 0;
         private byte[] SHA512Received = new byte[64];
         private long CurrentDownloadBytesInternal = 0;
         private long TotalDownloadBytesInternal = 0;
@@ -94,10 +94,10 @@ namespace ModemAPI
                 IsFirstPacket = true;
                 UnderlyingClient.OnMessageReceived += SRTPDataEvent;
                 UnderlyingModem.LowLevelTransmit(request.ToArray(), Destination, "lm_tunnel", ConnectionID);
-                TimestampRequestSent = DateTime.Now.Ticks;
+                TimestampLastPacket = DateTime.Now.Ticks;
                 while (IsReceivingData)
                 {
-                    if (IsFirstPacket && DateTime.Now.Ticks - TimestampRequestSent > ticksTimeout)
+                    if (DateTime.Now.Ticks - TimestampLastPacket > ticksTimeout)
                     {
                         throw new TimeoutException("LMDTP Obtain Request timed out...");
                     }
@@ -198,6 +198,7 @@ namespace ModemAPI
                             }
                         }
                     }
+                    TimestampLastPacket = DateTime.Now.Ticks;
                     CurrentDownloadBytesInternal = CurrentDestinationStream.Position;
                 }
             }

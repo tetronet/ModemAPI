@@ -17,7 +17,7 @@ namespace ModemAPI
         private HashSet<long> ReceivedNumbers = new HashSet<long>();
         private ConcurrentDictionary<long, byte[]> ReorderingBuffer = new ConcurrentDictionary<long, byte[]>();
         private ConcurrentDictionary<long, ReliablePacketInformation> InternalState = new ConcurrentDictionary<long, ReliablePacketInformation>();
-        private long InternalPacketTimer = 0;
+        private Stopwatch InternalPacketTimer = Stopwatch.StartNew();
         private bool FailedDueToTooManyRetxAttepms = false;
         private double ThrottlingPower = 1;
         /// <summary>
@@ -110,7 +110,7 @@ namespace ModemAPI
                 {
                     return;
                 }
-                if (packet.ConnectionID != ConnectionID || packet.QueryType != QueryType)
+                if (packet.ConnectionID != ConnectionID || packet.QueryType != QueryType || !packet.Transmitter.Equals(CommunicatingWith))
                 {
                     ModemAPIDebugger.OutputDebugMessage("SRTPClient MISMATCH CID OR QT!!!!!!!!!");
                     return;
@@ -133,12 +133,17 @@ namespace ModemAPI
                         OnAckReceived(id);
                         if (PacketLossBasedCongestionControl)
                         {
-                            ThrottlingPower = Math.Clamp(ThrottlingPower + 0.01 * (1 - ThrottlingPower), 0.1, 1);
+                            ThrottlingPower = Math.Clamp(ThrottlingPower + 0.01 * (1 - ThrottlingPower), 0.0001, 1);
                         }
                     }
                     if (dataReceived.Length > 8)
                     {
                         // == enqueue packets ==
+                        if (ReceivedNumbers.Contains(id))
+                        {
+                            UnivSend(dataReceived.AsSpan(0, 8).ToArray());
+                            return;
+                        }
                         if (LastReceived + MaxPacketNoFromFuture < id)
                         {
                             OnError(-996, $"Packet {id} is too deep into the future.");
@@ -178,7 +183,7 @@ namespace ModemAPI
                                 // if enabled, pause the transmission
                                 if (PacketLossBasedCongestionControl)
                                 {
-                                    ThrottlingPower = Math.Clamp(ThrottlingPower / 2, 0.1, 1);
+                                    ThrottlingPower = Math.Clamp(ThrottlingPower / 2, 0.0001, 1);
                                 }
                                 // call the user event
                                 OnRetransmit(info.Id);
@@ -213,7 +218,7 @@ namespace ModemAPI
             {
                 _ = Task.Run(async delegate ()
                 {
-                    while (true)
+                    while (!IsClosed)
                     {
                         ClearReorderingBuffer();
                         await Task.Delay(1000);
@@ -313,8 +318,8 @@ namespace ModemAPI
         {
             try
             {
-                while (TicksPacketDelay > Stopwatch.GetTimestamp() - InternalPacketTimer) { }
-                //SpinWait.SpinUntil(delegate () { return TicksPacketDelay > Stopwatch.GetTimestamp() - InternalPacketTimer; });
+                while (TicksPacketDelay > InternalPacketTimer.ElapsedTicks) { }
+                //SpinWait.SpinUntil(delegate () { return TicksPacketDelay > InternalPacketTimer.ElapsedTicks; });
                 if (data == null)
                 {
                     return;
@@ -325,7 +330,7 @@ namespace ModemAPI
                     return;
                 }
                 Modem.LowLevelTransmit(data, CommunicatingWith, QueryType, ConnectionID);
-                InternalPacketTimer = Stopwatch.GetTimestamp();
+                InternalPacketTimer.Restart();
             }
             catch (Exception ex)
             {
@@ -338,11 +343,6 @@ namespace ModemAPI
             {
                 UnivSend(dataFromBuffer.AsSpan(0, 8).ToArray());
                 ModemAPIDebugger.OutputDebugMessage($"UnivSend acknowledgement for packet {LastReceived + 1}");
-                if (ReceivedNumbers.Contains(LastReceived + 1))
-                {
-                    ModemAPIDebugger.OutputDebugMessage("received duplicate packets");
-                    return;
-                }
                 ReceivedNumbers.Add(LastReceived + 1);
                 ModemAPIDebugger.OutputDebugMessage("added to received numbers");
                 OnMessageReceived(this, dataFromBuffer[8..]); // call user events

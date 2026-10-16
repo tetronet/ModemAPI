@@ -21,6 +21,7 @@
             ulong mid,
             ushort rtp)
         {
+            DataBytes = bytes;
             Receiver = rx;
             Transmitter = tx;
             IsLastInSequence = last;
