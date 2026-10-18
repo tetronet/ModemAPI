@@ -3,6 +3,7 @@ using System.Buffers;
 using System.IO.Hashing;
 using System.IO.Ports;
 using System.Net.WebSockets;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using static System.Runtime.InteropServices.JavaScript.JSType;
@@ -29,6 +30,7 @@ namespace ModemAPI
         private bool IsProcessingMessage = false; // Flag to prevent working on the same packet more than 1 time.
         private bool InternalModemConnected = false;
         private bool WebSocketOrSocketIO = false; // false if socket.io, true if websocket
+        private PacketQueueAssembler QueueAssembler = new(1000000, 600000000);
         internal List<string> TakenNumbers = []; // Address Values, that were already taken by the Slave Modems
         public LargeMessage? LastDownloadedLargeMessage { get; set; }
         public bool IsModemConnected { get { return InternalModemConnected && LocalModemAddress != null && !LocalModemAddress.IsEmpty; } }
@@ -102,6 +104,20 @@ namespace ModemAPI
         /// <exception cref="NotImplementedException">I'm too lazy to implement this =]</exception>
         public void AttachReceiveEvent(Action<DataBlock, Action> onReceive)
         {
+            AttachReceiveEventNoUnfragment(delegate (Packet p, Action k)
+            {
+                QueueAssembler.AddPacket(p);
+                DataBlock? possibleAssembledPacketQueue = QueueAssembler.GetPacketQueue(p.MessageId)?.Assemble();
+                if (possibleAssembledPacketQueue != null)
+                {
+                    QueueAssembler.RemovePacketQueue(p.MessageId);
+                    onReceive(possibleAssembledPacketQueue, k);
+                }
+            });
+        }
+
+        /*public void AttachReceiveEvent(Action<DataBlock, Action> onReceive)
+        {
             InternalAttachReceiveEvent(delegate (Packet receivedData, Action stopLoop)
             {
                 if (LocalModemAddress == null)
@@ -135,7 +151,7 @@ namespace ModemAPI
                     }
                     
                     
-                    /*if (PacketBufferActualLength == 0)
+                    if (PacketBufferActualLength == 0)
                     {
                         isEverythingReceived = false;
                     }
@@ -149,7 +165,7 @@ namespace ModemAPI
                                 break;
                             }
                         }
-                    }*/
+                    }
                     if (isEverythingReceived && !IsProcessingMessage)
                     {
                         lock (PacketBufferLock)
@@ -234,9 +250,11 @@ namespace ModemAPI
                             }
                         }
                     }
+                    QueueAssembler.AddPacket(receivedData);
+                    QueueAssembler.
                 }
             });
-        }
+        }*/
         /// <summary>
         /// Creates a new slave modem for that Virtual Modem. Works only with L1_SERIAL wireType.
         /// </summary>

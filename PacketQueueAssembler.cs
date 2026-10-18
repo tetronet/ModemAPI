@@ -58,9 +58,14 @@ namespace ModemAPI
                 PacketQueues[packet.MessageId].AddPacket(packet);
             }
         }
-        public PacketQueue GetPacketQueue(ulong msgid)
+        public PacketQueue? GetPacketQueue(ulong msgid)
         {
-            return PacketQueues[msgid];
+            PacketQueues.TryGetValue(msgid, out PacketQueue? value);
+            return value;
+        }
+        public void RemovePacketQueue(ulong msgid)
+        {
+            PacketQueues.TryRemove(msgid, out _);
         }
         private void TimeoutCheckerLoop()
         {

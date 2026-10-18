@@ -630,9 +630,10 @@ namespace ModemAPI
             AttachReceiveEventNoUnfragment(delegate (Packet p, Action k)
             {
                 Assembler.AddPacket(p);
-                DataBlock? possibleAssembledPacketQueue = Assembler.GetPacketQueue(p.MessageId).Assemble();
+                DataBlock? possibleAssembledPacketQueue = Assembler.GetPacketQueue(p.MessageId)?.Assemble();
                 if (possibleAssembledPacketQueue != null)
                 {
+                    Assembler.RemovePacketQueue(p.MessageId);
                     onReceive(possibleAssembledPacketQueue, k);
                 }
             });

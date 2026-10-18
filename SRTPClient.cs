@@ -18,8 +18,9 @@ namespace ModemAPI
         private ConcurrentDictionary<long, byte[]> ReorderingBuffer = new ConcurrentDictionary<long, byte[]>();
         private ConcurrentDictionary<long, ReliablePacketInformation> InternalState = new ConcurrentDictionary<long, ReliablePacketInformation>();
         private Stopwatch InternalPacketTimer = Stopwatch.StartNew();
+        private Stopwatch LastWindowHalvingTimer = Stopwatch.StartNew();
         private bool FailedDueToTooManyRetxAttepms = false;
-        private double ThrottlingPower = 1;
+        private double ThrottlingPower = 0.01;
         /// <summary>
         /// Gets called for each received message by this client, and data of this message is sent to the event handler.
         /// </summary>
@@ -57,7 +58,7 @@ namespace ModemAPI
         /// </summary>
         public int TicksPacketDelay = 0;
         /// <summary>
-        /// If set to true, this client will stop sending any data for 2s on each retransmitted packet to prevent tetronet from doing OHHH MYY PCCCCAEAEAE
+        /// If set to true, this client will control the overload using Packet loss to prevent tetronet from doing OHHH MYY PCCCCAEAEAE
         /// </summary>
         public bool PacketLossBasedCongestionControl = false;
         /// <summary>
@@ -129,11 +130,13 @@ namespace ModemAPI
                     if (dataReceived.Length == 8)
                     {
                         // == ack receiver ==
-                        InternalState.TryRemove(id, out _);
-                        OnAckReceived(id);
-                        if (PacketLossBasedCongestionControl)
+                        if (InternalState.TryRemove(id, out _))
                         {
-                            ThrottlingPower = Math.Clamp(ThrottlingPower + 0.01 * (1 - ThrottlingPower), 0.0001, 1);
+                            OnAckReceived(id);
+                            if (PacketLossBasedCongestionControl)
+                            {
+                                ThrottlingPower = Math.Clamp(ThrottlingPower + 0.1 / MaxUnackedPackets, 0.0001, 1);
+                            }
                         }
                     }
                     if (dataReceived.Length > 8)
@@ -150,6 +153,8 @@ namespace ModemAPI
                             return;
                         }
                         ReorderingBuffer.TryAdd(id, dataReceived);
+                        UnivSend(dataReceived.AsSpan(0, 8).ToArray());
+                        ModemAPIDebugger.OutputDebugMessage($"UnivSend acknowledgement for packet {id}");
                     }
                 }
                 catch (Exception e)
@@ -183,7 +188,11 @@ namespace ModemAPI
                                 // if enabled, pause the transmission
                                 if (PacketLossBasedCongestionControl)
                                 {
-                                    ThrottlingPower = Math.Clamp(ThrottlingPower / 2, 0.0001, 1);
+                                    if (LastWindowHalvingTimer.Elapsed.Ticks > TicksTimeout)
+                                    {
+                                        ThrottlingPower = Math.Clamp(ThrottlingPower / 2, 0.0001, 1);
+                                        LastWindowHalvingTimer.Restart();
+                                    }
                                 }
                                 // call the user event
                                 OnRetransmit(info.Id);
@@ -318,7 +327,7 @@ namespace ModemAPI
         {
             try
             {
-                while (TicksPacketDelay > InternalPacketTimer.ElapsedTicks) { }
+                while (TicksPacketDelay > InternalPacketTimer.Elapsed.Ticks) { }
                 //SpinWait.SpinUntil(delegate () { return TicksPacketDelay > InternalPacketTimer.ElapsedTicks; });
                 if (data == null)
                 {
@@ -341,8 +350,6 @@ namespace ModemAPI
         {
             while (ReorderingBuffer.TryRemove(LastReceived + 1, out byte[]? dataFromBuffer))
             {
-                UnivSend(dataFromBuffer.AsSpan(0, 8).ToArray());
-                ModemAPIDebugger.OutputDebugMessage($"UnivSend acknowledgement for packet {LastReceived + 1}");
                 ReceivedNumbers.Add(LastReceived + 1);
                 ModemAPIDebugger.OutputDebugMessage("added to received numbers");
                 OnMessageReceived(this, dataFromBuffer[8..]); // call user events
