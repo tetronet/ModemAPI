@@ -69,35 +69,39 @@ namespace ModemAPI
             BaseModem.AttachReceiveEventNoUnfragment(delegate (Packet p, Action k)
             {
                 //Console.WriteLine($"Received net data: address={p.Transmitter} qt={p.QueryType} cid={p.ConnectionID}");
+                // this runs for every packet of every session, so only a new LMDTP request may get past these cheap checks
+                if (ConnectionIDRangeStart > p.ConnectionID || p.ConnectionID > ConnectionIDRangeEnd ||
+                    p.QueryType != "lm_tunnel" ||
+                    p.DataBytes.Length < 2 ||
+                    BinaryPrimitives.ReadUInt16BigEndian(p.DataBytes) != LMDTPClient.LMDTP_REQUEST_PREFIX ||
+                    Clients.ContainsKey((p.Transmitter, p.ConnectionID)))
+                {
+                    return;
+                }
+                if (!CheckGrayList(p.Transmitter))
+                {
+                    ErrorOccured(new UnauthorizedAccessException($"User from remote address {p.Transmitter} was trying to access this LMDTP while he is {(IsListBlackOrWhite ? "not included in White" : "is included in Black")} List"));
+                    return;
+                }
                 Task.Run(delegate ()
                 {
-                    if (CheckGrayList(p.Transmitter))
+                    SRTPClient temp = new(BaseModem, p.Transmitter, "lm_tunnel", p.ConnectionID, SrtpTimeout);
+                    temp.PacketLossBasedCongestionControl = SrtpEnablePacketLossBasedRateLimiter;
+                    temp.TicksPacketDelay = SrtpRateLimiting;
+                    temp.RetransmissionsBeforeConsideringRemoteSideDead = 10;
+                    temp.OnError += delegate (int code, string desc)
                     {
-                        if (Clients.ContainsKey((p.Transmitter, p.ConnectionID)) || BinaryPrimitives.ReadUInt16BigEndian(p.DataBytes) != LMDTPClient.LMDTP_REQUEST_PREFIX || ConnectionIDRangeStart > p.ConnectionID || p.ConnectionID > ConnectionIDRangeEnd)
-                        {
-                            return;
-                        }
-                        SRTPClient temp = new(BaseModem, p.Transmitter, "lm_tunnel", p.ConnectionID, SrtpTimeout);
-                        temp.PacketLossBasedCongestionControl = SrtpEnablePacketLossBasedRateLimiter;
-                        temp.TicksPacketDelay = SrtpRateLimiting;
-                        temp.RetransmissionsBeforeConsideringRemoteSideDead = 10;
-                        temp.OnError += delegate (int code, string desc)
-                        {
-                            ErrorOccured(new Exception($"SRTP ERRNO {code}: {desc}"));
-                        };
+                        ErrorOccured(new Exception($"SRTP ERRNO {code}: {desc}"));
+                    };
+                    if (Clients.TryAdd((p.Transmitter, p.ConnectionID), temp))
+                    {
                         SRTPClientReceived(p.Transmitter, p.ConnectionID);
-                        if (Clients.TryAdd((p.Transmitter, p.ConnectionID), temp))
-                        {
-                            HandleClient(p.Transmitter, p.ConnectionID, p.DataBytes);
-                        }
-                        else
-                        {
-                            //Console.WriteLine($"Failed to add client from adddress {p.Transmitter} and Cid {p.ConnectionID}");
-                        }
+                        HandleClient(p.Transmitter, p.ConnectionID, p.DataBytes);
                     }
                     else
                     {
-                        ErrorOccured(new UnauthorizedAccessException($"User from remote address {p.Transmitter} was trying to access this LMDTP while he is {(IsListBlackOrWhite ? "not included in White" : "is included in Black")} List"));
+                        // the same request was already taken by another task, this client must not stay subscribed to the modem
+                        temp.Close();
                     }
                 });
                 //Console.WriteLine("Processed all net data");

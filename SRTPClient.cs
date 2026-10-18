@@ -17,7 +17,9 @@ namespace ModemAPI
         private HashSet<long> ReceivedNumbers = new HashSet<long>();
         private ConcurrentDictionary<long, byte[]> ReorderingBuffer = new ConcurrentDictionary<long, byte[]>();
         private ConcurrentDictionary<long, ReliablePacketInformation> InternalState = new ConcurrentDictionary<long, ReliablePacketInformation>();
-        private Stopwatch InternalPacketTimer = Stopwatch.StartNew();
+        private long NextSendTimestamp = 0;
+        private readonly Lock PacingLock = new();
+        private readonly SemaphoreSlim ReorderSignal = new(0, 1);
         private Stopwatch LastWindowHalvingTimer = Stopwatch.StartNew();
         private bool FailedDueToTooManyRetxAttepms = false;
         private double ThrottlingPower = 0.01;
@@ -105,63 +107,7 @@ namespace ModemAPI
             CommunicatingWith = dst;
             TicksTimeout = tickTimeout;
             // receiver task
-            Modem.AttachReceiveEventNoUnfragment(delegate (Packet packet, Action k)
-            {
-                if (IsClosed)
-                {
-                    return;
-                }
-                if (packet.ConnectionID != ConnectionID || packet.QueryType != QueryType || !packet.Transmitter.Equals(CommunicatingWith))
-                {
-                    ModemAPIDebugger.OutputDebugMessage("SRTPClient MISMATCH CID OR QT!!!!!!!!!");
-                    return;
-                }
-                try
-                {
-                    byte[] dataReceived = packet.DataBytes;
-                    // parse received packet
-                    if (dataReceived.Length < 8)
-                    {
-                        OnError(16, "Packet too short.");
-                        return;
-                    }
-                    long id = BinaryPrimitives.ReadInt64BigEndian(dataReceived);
-
-                    if (dataReceived.Length == 8)
-                    {
-                        // == ack receiver ==
-                        if (InternalState.TryRemove(id, out _))
-                        {
-                            OnAckReceived(id);
-                            if (PacketLossBasedCongestionControl)
-                            {
-                                ThrottlingPower = Math.Clamp(ThrottlingPower + 0.1 / MaxUnackedPackets, 0.0001, 1);
-                            }
-                        }
-                    }
-                    if (dataReceived.Length > 8)
-                    {
-                        // == enqueue packets ==
-                        if (ReceivedNumbers.Contains(id))
-                        {
-                            UnivSend(dataReceived.AsSpan(0, 8).ToArray());
-                            return;
-                        }
-                        if (LastReceived + MaxPacketNoFromFuture < id)
-                        {
-                            OnError(-996, $"Packet {id} is too deep into the future.");
-                            return;
-                        }
-                        ReorderingBuffer.TryAdd(id, dataReceived);
-                        UnivSend(dataReceived.AsSpan(0, 8).ToArray());
-                        ModemAPIDebugger.OutputDebugMessage($"UnivSend acknowledgement for packet {id}");
-                    }
-                }
-                catch (Exception e)
-                {
-                    OnError(-1, "Exception: " + e.ToString());
-                }
-            });
+            Modem.AttachReceiveEventNoUnfragment(OnPacketReceived);
             // error correction task
             _ = Task.Run(async delegate ()
             {
@@ -219,7 +165,8 @@ namespace ModemAPI
                     {
                         OnError(-1, "Exception: " + e.ToString());
                     }
-                    await Task.Delay(1);
+                    // wake up on a new packet instead of polling, the timeout is just a safety net
+                    await ReorderSignal.WaitAsync(100);
                 }
             });
             // autoclear task
@@ -233,6 +180,79 @@ namespace ModemAPI
                         await Task.Delay(1000);
                     }
                 });
+            }
+        }
+        private void OnPacketReceived(Packet packet, Action k)
+        {
+            if (IsClosed)
+            {
+                return;
+            }
+            if (packet.ConnectionID != ConnectionID || packet.QueryType != QueryType || !packet.Transmitter.Equals(CommunicatingWith))
+            {
+                ModemAPIDebugger.OutputDebugMessage("SRTPClient MISMATCH CID OR QT!!!!!!!!!");
+                return;
+            }
+            try
+            {
+                byte[] dataReceived = packet.DataBytes;
+                // parse received packet
+                if (dataReceived.Length < 8)
+                {
+                    OnError(16, "Packet too short.");
+                    return;
+                }
+                long id = BinaryPrimitives.ReadInt64BigEndian(dataReceived);
+
+                if (dataReceived.Length == 8)
+                {
+                    // == ack receiver ==
+                    if (InternalState.TryRemove(id, out _))
+                    {
+                        OnAckReceived(id);
+                        if (PacketLossBasedCongestionControl)
+                        {
+                            ThrottlingPower = Math.Clamp(ThrottlingPower + 0.1 / MaxUnackedPackets, 0.0001, 1);
+                        }
+                    }
+                }
+                if (dataReceived.Length > 8)
+                {
+                    // == enqueue packets ==
+                    if (ReceivedNumbers.Contains(id))
+                    {
+                        UnivSend(dataReceived.AsSpan(0, 8).ToArray());
+                        return;
+                    }
+                    if (LastReceived + MaxPacketNoFromFuture < id)
+                    {
+                        OnError(-996, $"Packet {id} is too deep into the future.");
+                        return;
+                    }
+                    ReorderingBuffer.TryAdd(id, dataReceived);
+                    WakeUpReorderTask();
+                    UnivSend(dataReceived.AsSpan(0, 8).ToArray());
+                    ModemAPIDebugger.OutputDebugMessage($"UnivSend acknowledgement for packet {id}");
+                }
+            }
+            catch (Exception e)
+            {
+                OnError(-1, "Exception: " + e.ToString());
+            }
+        }
+        private void WakeUpReorderTask()
+        {
+            if (ReorderSignal.CurrentCount != 0)
+            {
+                return;
+            }
+            try
+            {
+                ReorderSignal.Release();
+            }
+            catch (SemaphoreFullException)
+            {
+                // another thread has already woken it up
             }
         }
         public bool AreAllPacketsFromReorderingBufferIncludedInAlreadyReceived()
@@ -313,6 +333,8 @@ namespace ModemAPI
         public void Close()
         {
             IsClosed = true;
+            Modem.DetachReceiveEventNoUnfragment(OnPacketReceived);
+            WakeUpReorderTask();
             ReorderingBuffer.Clear();
             ReceivedNumbers.Clear();
             InternalState.Clear();
@@ -327,8 +349,7 @@ namespace ModemAPI
         {
             try
             {
-                while (TicksPacketDelay > InternalPacketTimer.Elapsed.Ticks) { }
-                //SpinWait.SpinUntil(delegate () { return TicksPacketDelay > InternalPacketTimer.ElapsedTicks; });
+                WaitForSendSlot();
                 if (data == null)
                 {
                     return;
@@ -339,11 +360,40 @@ namespace ModemAPI
                     return;
                 }
                 Modem.LowLevelTransmit(data, CommunicatingWith, QueryType, ConnectionID);
-                InternalPacketTimer.Restart();
             }
             catch (Exception ex)
             {
                 OnError(1800, "UNIVSEND failed: " + ex);
+            }
+        }
+        /// <summary>
+        /// Paces sends to one per <see cref="TicksPacketDelay"/> on average. Instead of spinning between every two packets,
+        /// the thread sleeps only once it gets ahead of the schedule, and catches up after an oversleep by sending a short burst.
+        /// </summary>
+        private void WaitForSendSlot()
+        {
+            if (TicksPacketDelay <= 0)
+            {
+                return;
+            }
+            long delay = TicksPacketDelay * Stopwatch.Frequency / TimeSpan.TicksPerSecond;
+            long maxLag = Stopwatch.Frequency / 50; // 20 ms, longer than the Windows timer resolution
+            long minSleep = Stopwatch.Frequency / 500; // 2 ms
+            long wait;
+            lock (PacingLock)
+            {
+                long now = Stopwatch.GetTimestamp();
+                if (NextSendTimestamp < now - maxLag)
+                {
+                    // the client was idle, not oversleeping, so there is nothing to catch up
+                    NextSendTimestamp = now;
+                }
+                wait = NextSendTimestamp - now;
+                NextSendTimestamp += delay;
+            }
+            if (wait >= minSleep)
+            {
+                Thread.Sleep(TimeSpan.FromTicks(wait * TimeSpan.TicksPerSecond / Stopwatch.Frequency));
             }
         }
         private void ForceReadAllAvailablePackets()

@@ -23,6 +23,11 @@ namespace ModemAPI
         private byte[]? MessageBufferBytes = null;
         private int MessageBufferBytesCursor = 0;
         private event Action<Packet, Action> InternalPacketEvents = delegate { };
+        private readonly SubscriberList<Packet> PacketSubscribers = new();
+        private readonly SubscriberList<DataBlock> DataBlockSubscribers = new();
+        private readonly Lock PacketDispatcherLock = new();
+        private bool PacketDispatcherAttached = false;
+        private bool AssemblerAttached = false;
         private Dictionary<string, LowLatencyAnsweringPhysicalModem> SlavePhysicalModems = []; // Slave physical modem list
         private Dictionary<string, string> AddressPortPairs = []; // For slave physical modems
         private IPacketRouter? InnerRouter = null;
@@ -104,16 +109,37 @@ namespace ModemAPI
         /// <exception cref="NotImplementedException">I'm too lazy to implement this =]</exception>
         public void AttachReceiveEvent(Action<DataBlock, Action> onReceive)
         {
-            AttachReceiveEventNoUnfragment(delegate (Packet p, Action k)
+            DataBlockSubscribers.Add(onReceive);
+            lock (PacketDispatcherLock)
             {
-                QueueAssembler.AddPacket(p);
-                DataBlock? possibleAssembledPacketQueue = QueueAssembler.GetPacketQueue(p.MessageId)?.Assemble();
-                if (possibleAssembledPacketQueue != null)
+                if (AssemblerAttached)
                 {
-                    QueueAssembler.RemovePacketQueue(p.MessageId);
-                    onReceive(possibleAssembledPacketQueue, k);
+                    return;
                 }
-            });
+                AssemblerAttached = true;
+            }
+            // one assembler for the whole modem, so every subscriber gets each assembled data block
+            AttachReceiveEventNoUnfragment(AssemblePacket);
+        }
+
+        public void DetachReceiveEvent(Action<DataBlock, Action> onReceive)
+        {
+            DataBlockSubscribers.Remove(onReceive);
+        }
+
+        private void AssemblePacket(Packet p, Action k)
+        {
+            if (DataBlockSubscribers.Count == 0)
+            {
+                return;
+            }
+            QueueAssembler.AddPacket(p);
+            DataBlock? possibleAssembledPacketQueue = QueueAssembler.GetPacketQueue(p.MessageId)?.Assemble();
+            // only the call that removed the queue delivers it, so a data block is never delivered twice
+            if (possibleAssembledPacketQueue != null && QueueAssembler.RemovePacketQueue(p.MessageId))
+            {
+                DataBlockSubscribers.Invoke(possibleAssembledPacketQueue, k);
+            }
         }
 
         /*public void AttachReceiveEvent(Action<DataBlock, Action> onReceive)
@@ -719,7 +745,7 @@ namespace ModemAPI
                 packet.IsLastInSequence = (i / packetSize) == (Math.Ceiling((double)data.Length / packetSize) - 1);
                 packet.Receiver = address;
                 packet.Transmitter = LocalModemAddress;
-                packet.PacketNo = (byte)(i / packetSize);
+                packet.PacketNo = (ulong)(i / packetSize);
                 packet.MessageId = mid;
                 packet.RoutersToPass = ttl;
                 Transmit(packet);
@@ -755,7 +781,7 @@ namespace ModemAPI
                 packet.IsLastInSequence = (i / packetSize) == (Math.Ceiling((double)data.Length / packetSize) - 1);
                 packet.Receiver = address;
                 packet.Transmitter = LocalModemAddress;
-                packet.PacketNo = (byte)(i / packetSize);
+                packet.PacketNo = (ulong)(i / packetSize);
                 packet.MessageId = mid;
                 packet.RoutersToPass = ttl;
                 //Console.WriteLine("the value at line 258 is : " + (i + packetSize) + " and packet estimated packsize will be : " + packetSize);
@@ -1012,18 +1038,38 @@ namespace ModemAPI
 
         public void AttachReceiveEventNoUnfragment(Action<Packet, Action> onReceive)
         {
-            InternalAttachReceiveEvent(delegate (Packet p, Action k)
+            PacketSubscribers.Add(onReceive);
+            lock (PacketDispatcherLock)
             {
-                if (LocalModemAddress == null)
+                if (!PacketDispatcherAttached)
                 {
-                    throw new NullAddressException("local modem address was null");
+                    // one handler checks the receiver address once and hands the packet to every subscriber
+                    InternalAttachReceiveEvent(DispatchPacket);
+                    PacketDispatcherAttached = true;
                 }
-                if (p.Receiver.AddressValue != LocalModemAddress.AddressValue)
-                {
-                    return;
-                }
-                onReceive(p, k);
-            });
+            }
+        }
+
+        public void DetachReceiveEventNoUnfragment(Action<Packet, Action> onReceive)
+        {
+            PacketSubscribers.Remove(onReceive);
+        }
+
+        private void DispatchPacket(Packet p, Action k)
+        {
+            if (PacketSubscribers.Count == 0)
+            {
+                return;
+            }
+            if (LocalModemAddress == null)
+            {
+                throw new NullAddressException("local modem address was null");
+            }
+            if (p.Receiver.AddressValue != LocalModemAddress.AddressValue)
+            {
+                return;
+            }
+            PacketSubscribers.Invoke(p, k);
         }
 
         private Address SMLARequest(string modemName)

@@ -72,60 +72,72 @@ namespace ModemAPI
                 if (tcp != null)
                 {
                     tcp.Start(1);
-                    Task.Run(delegate ()
+                    Task.Factory.StartNew(delegate ()
                     {
                         while (true)
                         {
-                            if (tcp.Pending())
+                            try
                             {
+                                // blocks until a client connects instead of polling Pending() in a loop
                                 session = tcp.AcceptTcpClient();
                             }
+                            catch (ObjectDisposedException)
+                            {
+                                break;
+                            }
+                            catch
+                            {
+                                Thread.Sleep(50);
+                            }
                         }
-                    });
+                    }, TaskCreationOptions.LongRunning);
                 }
             }
 
             private void TcpReader()
             {
+                byte[] buffer = new byte[65536];
                 while (true)
                 {
-                    if (session == null)
+                    TcpClient? current = session;
+                    if (current == null || !current.Connected)
                     {
                         Thread.Sleep(50);
                         continue;
                     }
-                    if (!session.Connected)
+                    try
                     {
-                        Thread.Sleep(50);
-                        continue;
-                    }
-                    byte[] buffer = new byte[session.Available];
-                    int read = session.GetStream().Read(buffer, 0, buffer.Length);
-                    if (read > 0)
-                    {
+                        // blocks until data arrives, so the thread doesn't spin while the line is idle
+                        int read = current.GetStream().Read(buffer, 0, buffer.Length);
+                        if (read == 0)
+                        {
+                            // remote side closed the connection, Read would return 0 immediately again
+                            ModemAPIDebugger.OutputDebugMessage($"low latency ans physical modem was not able to read data from tcp");
+                            Thread.Sleep(50);
+                            continue;
+                        }
                         ModemAPIDebugger.OutputDebugMessage($"low latency ans physical modem received data from tcp");
-                        ModemAPIDebugger.PrintByteArray(buffer);
-                        L1RxBuffer.AddRange(buffer.Take(read));
+                        L1RxBuffer.AddRange(buffer.AsSpan(0, read));
+                        // one read may carry several frames, all of them must be handled before blocking again
+                        while (L1RxBuffer.Count >= 3)
+                        {
+                            int length =
+                                L1RxBuffer[0] << 16 |
+                                L1RxBuffer[1] << 8 |
+                                L1RxBuffer[2];
+                            if (L1RxBuffer.Count < length + 3)
+                            {
+                                break;
+                            }
+                            byte[] data = L1RxBuffer.GetRange(3, length).ToArray();
+                            L1RxBuffer.RemoveRange(0, length + 3);
+                            CallAllEvents(data, delegate () { throw new NotImplementedException(); });
+                        }
                     }
-                    else
+                    catch
                     {
-                        ModemAPIDebugger.OutputDebugMessage($"low latency ans physical modem was not able to read data from tcp");
-                    }
-                    if (L1RxBuffer.Count < 3)
-                    {
-                        // not enough bytes
-                        ModemAPIDebugger.OutputDebugMessage("not enough bytes");
-                        continue;
-                    }
-                    int length =
-                        L1RxBuffer[0] << 16 &
-                        L1RxBuffer[1] << 8 &
-                        L1RxBuffer[2];
-                    if (L1RxBuffer.Count > length + 3)
-                    {
-                        byte[] data = [.. L1RxBuffer.Skip(3).Take(length)];
-                        L1RxBuffer.RemoveRange(0, length + 3);
-                        CallAllEvents(data, delegate () { throw new NotImplementedException(); });
+                        ModemAPIDebugger.OutputDebugMessage("error during tcp read");
+                        Thread.Sleep(50);
                     }
                 }
             }
@@ -155,7 +167,7 @@ namespace ModemAPI
 
             private void CallAllEvents(byte[] a, Action b)
             {
-                foreach (Action<byte[], Action> action in readEvents)
+                foreach (Action<byte[], Action> action in readEvents.ToArray()) // handlers may be added while the reader thread is running
                 {
                     action(a, b);
                 }
@@ -195,13 +207,11 @@ namespace ModemAPI
                         throw new NullTransmitterException("tcp");
                     }
                     // convert length of the buffer to bytes
-                    byte hi = (byte)(data.Length & 0xFF0000 >> 16);
-                    byte mid = (byte)(data.Length & 0xFF00 >> 8);
-                    byte lo = (byte)(data.Length & 0xFF);
+                    byte hi = (byte)((data.Length & 0xFF0000) >> 16);
+                    byte mid = (byte)((data.Length & 0x00FF00) >> 8);
+                    byte lo = (byte)(data.Length & 0x0000FF);
                     // send these bytes
-                    session.GetStream().WriteByte(hi);
-                    session.GetStream().WriteByte(mid);
-                    session.GetStream().WriteByte(lo);
+                    session.GetStream().Write([hi, mid, lo]);
                     session.GetStream().Write(data, 0, data.Length);
                 }
                 if (t == L1Types.L1_INET_UDP)
@@ -252,7 +262,8 @@ namespace ModemAPI
                     readEvents.Add(onSuccessfulRead); // add event to the list of events
                     if (!subscribedForReadingFromTcp)
                     {
-                        Task.Run(TcpReader);
+                        subscribedForReadingFromTcp = true;
+                        Task.Factory.StartNew(TcpReader, TaskCreationOptions.LongRunning);
                     }
                 }
                 if (t == L1Types.L1_INET_UDP)
@@ -260,7 +271,8 @@ namespace ModemAPI
                     readEvents.Add(onSuccessfulRead); // add event to the list of events
                     if (!subscribedForReadingFromUdp)
                     {
-                        Task.Run(UdpReader);
+                        subscribedForReadingFromUdp = true;
+                        Task.Factory.StartNew(UdpReader, TaskCreationOptions.LongRunning);
                     }
                 }
             }

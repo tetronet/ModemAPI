@@ -13,6 +13,7 @@ namespace ModemAPI
         private bool IsListening = false;
         private bool IsClosed = false;
         private event Action<Address, string> ReceivedLMAck = delegate { };
+        private Action<Packet, Action>? NotificationHandler = null;
         /// <summary>
         /// Gets invoked each time a notification for downloading a remote large message comes, and you will get the: notification sender's <see cref="Address"/>, the server's address <see cref="Address"/> which has the large message available to obtain and remote resource name, that you will want to obtain using LMDTP or other protocols.
         /// </summary>
@@ -32,13 +33,14 @@ namespace ModemAPI
         public NLMNPClient(IModem modem)
         {
             Modem = modem;
-            Modem.AttachReceiveEventNoUnfragment(delegate (Packet packet, Action obsolete)
+            Modem.AttachReceiveEventNoUnfragment(OnAckPacket);
+        }
+        private void OnAckPacket(Packet packet, Action obsolete)
+        {
+            if (packet.ConnectionID == 4000000015 && packet.QueryType == "lm_ack_notify")
             {
-                if (packet.ConnectionID == 4000000015 && packet.QueryType == "lm_ack_notify")
-                {
-                    ReceivedLMAck(packet.Transmitter, Encoding.UTF8.GetString(packet.DataBytes));
-                }
-            });
+                ReceivedLMAck(packet.Transmitter, Encoding.UTF8.GetString(packet.DataBytes));
+            }
         }
         /// <summary>
         /// Makes this <see cref="NLMNPClient"/> to listen to incoming large message notifications.
@@ -52,7 +54,7 @@ namespace ModemAPI
             }
             if (!IsListening)
             {
-                Modem.AttachReceiveEventNoUnfragment(delegate (Packet packet, Action obsolete)
+                NotificationHandler = delegate (Packet packet, Action obsolete)
                 {
                     try
                     {
@@ -73,7 +75,8 @@ namespace ModemAPI
                     {
                         OnErrorReceived(ex);
                     }
-                });
+                };
+                Modem.AttachReceiveEventNoUnfragment(NotificationHandler);
             }
             else
             {
@@ -148,6 +151,11 @@ namespace ModemAPI
                 throw new OperationCanceledException("This client is closed.");
             }
             IsClosed = true;
+            Modem.DetachReceiveEventNoUnfragment(OnAckPacket);
+            if (NotificationHandler != null)
+            {
+                Modem.DetachReceiveEventNoUnfragment(NotificationHandler);
+            }
             ReceivedLMAck = delegate { };
             OnNotificationReceived = delegate { };
             OnErrorReceived = delegate { };

@@ -15,7 +15,17 @@
         void Transmit(string data, Address address, string queryType, uint connectionId, string? metadata = null, ushort packetSize = 1024, int delay = 0, ushort ttl = 65535);
         void LowLevelTransmit(byte[] data, Address address, string queryType, uint connectionId, string? metadata = null, ushort ttl = 65535);
         void AttachReceiveEvent(Action<DataBlock, Action> onReceive);
+        /// <summary>
+        /// Removes a delegate, that was added with <see cref="AttachReceiveEvent"/>.
+        /// </summary>
+        /// <param name="onReceive">The same delegate, that was attached</param>
+        void DetachReceiveEvent(Action<DataBlock, Action> onReceive) { }
         void AttachReceiveEventNoUnfragment(Action<Packet, Action> onReceive);
+        /// <summary>
+        /// Removes a delegate, that was added with <see cref="AttachReceiveEventNoUnfragment"/>.
+        /// </summary>
+        /// <param name="onReceive">The same delegate, that was attached</param>
+        void DetachReceiveEventNoUnfragment(Action<Packet, Action> onReceive) { }
         bool IsAddressSMLA();
         Task GetLargeMessage(Address transmitter);
         Task GetLargeMessage(Address tx, Address rx);

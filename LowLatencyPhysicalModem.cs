@@ -29,6 +29,11 @@ namespace ModemAPI
                 SingleWriter = false
             });
         private volatile bool TxLoopWorking = false;
+        private readonly SubscriberList<Packet> PacketSubscribers = new();
+        private readonly SubscriberList<DataBlock> DataBlockSubscribers = new();
+        private readonly Lock PacketDispatcherLock = new();
+        private bool PacketDispatcherAttached = false;
+        private bool AssemblerAttached = false;
 
         public int MaxReinitializeAttempts { get; set; }
         /// <summary>
@@ -89,6 +94,7 @@ namespace ModemAPI
 
             private void TcpReader()
             {
+                byte[] buffer = new byte[65536];
                 while (true)
                 {
                     if (tcp == null)
@@ -102,31 +108,29 @@ namespace ModemAPI
                     }
                     try
                     {
-                        byte[] buffer = new byte[tcp.Available];
+                        // blocks until data arrives, so the thread doesn't spin while the line is idle
                         int read = tcp.GetStream().Read(buffer, 0, buffer.Length);
-                        if (read > 0)
+                        if (read == 0)
                         {
-                            ModemAPIDebugger.OutputDebugMessage($"low latency physical modem received data from tcp");
-                            L1RxBuffer.AddRange(buffer.Take(read));
-                        }
-                        else
-                        {
+                            // remote side closed the connection, Read would return 0 immediately again
                             ModemAPIDebugger.OutputDebugMessage($"low latency physical modem was not able to read data from tcp");
-                        }
-                        
-                        if (L1RxBuffer.Count < 3)
-                        {
-                            // not enough bytes
-                            ModemAPIDebugger.OutputDebugMessage("not enough bytes");
+                            Thread.Sleep(50);
                             continue;
                         }
-                        int length =
-                            L1RxBuffer[0] << 16 |
-                            L1RxBuffer[1] << 8 |
-                            L1RxBuffer[2];
-                        if (L1RxBuffer.Count >= length + 3)
+                        ModemAPIDebugger.OutputDebugMessage($"low latency physical modem received data from tcp");
+                        L1RxBuffer.AddRange(buffer.AsSpan(0, read));
+                        // one read may carry several frames, all of them must be handled before blocking again
+                        while (L1RxBuffer.Count >= 3)
                         {
-                            byte[] data = [.. L1RxBuffer.Skip(3).Take(length)];
+                            int length =
+                                L1RxBuffer[0] << 16 |
+                                L1RxBuffer[1] << 8 |
+                                L1RxBuffer[2];
+                            if (L1RxBuffer.Count < length + 3)
+                            {
+                                break;
+                            }
+                            byte[] data = L1RxBuffer.GetRange(3, length).ToArray();
                             L1RxBuffer.RemoveRange(0, length + 3);
                             CallAllEvents(data, delegate () { throw new NotImplementedException(); });
                         }
@@ -134,6 +138,7 @@ namespace ModemAPI
                     catch
                     {
                         ModemAPIDebugger.OutputDebugMessage("error during tcp read");
+                        Thread.Sleep(50);
                     }
                 }
             }
@@ -163,7 +168,7 @@ namespace ModemAPI
 
             private void CallAllEvents(byte[] a, Action b)
             {
-                foreach (Action<byte[], Action> action in readEvents)
+                foreach (Action<byte[], Action> action in readEvents.ToArray()) // handlers may be added while the reader thread is running
                 {
                     action(a, b);
                 }
@@ -205,13 +210,11 @@ namespace ModemAPI
                             throw new NullTransmitterException("tcp");
                         }
                         // convert length of the buffer to bytes
-                        byte hi = (byte)(data.Length & 0xFF0000 >> 16);
-                        byte mid = (byte)(data.Length & 0xFF00 >> 8);
-                        byte lo = (byte)(data.Length & 0xFF);
+                        byte hi = (byte)((data.Length & 0xFF0000) >> 16);
+                        byte mid = (byte)((data.Length & 0x00FF00) >> 8);
+                        byte lo = (byte)(data.Length & 0x0000FF);
                         // send these bytes
-                        tcp.GetStream().WriteByte(hi);
-                        tcp.GetStream().WriteByte(mid);
-                        tcp.GetStream().WriteByte(lo);
+                        tcp.GetStream().Write([hi, mid, lo]);
                         tcp.GetStream().Write(data, 0, data.Length);
                     }
                     if (t == L1Types.L1_INET_UDP)
@@ -263,7 +266,8 @@ namespace ModemAPI
                     readEvents.Add(onSuccessfulRead); // add event to the list of events
                     if (!subscribedForReadingFromTcp)
                     {
-                        Task.Run(TcpReader);
+                        subscribedForReadingFromTcp = true;
+                        Task.Factory.StartNew(TcpReader, TaskCreationOptions.LongRunning);
                     }
                 }
                 if (t == L1Types.L1_INET_UDP)
@@ -271,7 +275,8 @@ namespace ModemAPI
                     readEvents.Add(onSuccessfulRead); // add event to the list of events
                     if (!subscribedForReadingFromUdp)
                     {
-                        Task.Run(UdpReader);
+                        subscribedForReadingFromUdp = true;
+                        Task.Factory.StartNew(UdpReader, TaskCreationOptions.LongRunning);
                     }
                 }
             }
@@ -493,7 +498,7 @@ namespace ModemAPI
                     IsLastInSequence = (i / packetSize) == (Math.Ceiling((double)data.Length / packetSize) - 1),
                     Receiver = address,
                     Transmitter = LocalModemAddress,
-                    PacketNo = (byte)(i / packetSize),
+                    PacketNo = (ulong)(i / packetSize),
                     MessageId = mid,
                     RoutersToPass = ttl
                 };
@@ -552,7 +557,7 @@ namespace ModemAPI
                     IsLastInSequence = (i / packetSize) == (Math.Ceiling((double)data.Length / packetSize) - 1),
                     Receiver = address,
                     Transmitter = LocalModemAddress,
-                    PacketNo = (byte)(i / packetSize),
+                    PacketNo = (ulong)(i / packetSize),
                     MessageId = mid,
                     RoutersToPass = ttl
                 };
@@ -627,34 +632,72 @@ namespace ModemAPI
 
         public void AttachReceiveEvent(Action<DataBlock, Action> onReceive)
         {
-            AttachReceiveEventNoUnfragment(delegate (Packet p, Action k)
+            DataBlockSubscribers.Add(onReceive);
+            lock (PacketDispatcherLock)
             {
-                Assembler.AddPacket(p);
-                DataBlock? possibleAssembledPacketQueue = Assembler.GetPacketQueue(p.MessageId)?.Assemble();
-                if (possibleAssembledPacketQueue != null)
+                if (AssemblerAttached)
                 {
-                    Assembler.RemovePacketQueue(p.MessageId);
-                    onReceive(possibleAssembledPacketQueue, k);
+                    return;
                 }
-            });
+                AssemblerAttached = true;
+            }
+            // one assembler for the whole modem, so every subscriber gets each assembled data block
+            AttachReceiveEventNoUnfragment(AssemblePacket);
+        }
+
+        public void DetachReceiveEvent(Action<DataBlock, Action> onReceive)
+        {
+            DataBlockSubscribers.Remove(onReceive);
+        }
+
+        private void AssemblePacket(Packet p, Action k)
+        {
+            if (DataBlockSubscribers.Count == 0)
+            {
+                return;
+            }
+            Assembler.AddPacket(p);
+            DataBlock? possibleAssembledPacketQueue = Assembler.GetPacketQueue(p.MessageId)?.Assemble();
+            // only the call that removed the queue delivers it, so a data block is never delivered twice
+            if (possibleAssembledPacketQueue != null && Assembler.RemovePacketQueue(p.MessageId))
+            {
+                DataBlockSubscribers.Invoke(possibleAssembledPacketQueue, k);
+            }
         }
 
         public void AttachReceiveEventNoUnfragment(Action<Packet, Action> onReceive)
         {
-            Communicator.OnDataRead(delegate (byte[] b, Action k)
+            PacketSubscribers.Add(onReceive);
+            lock (PacketDispatcherLock)
             {
-                if (PacketConverter.CheckIsPacket(b))
+                if (!PacketDispatcherAttached)
                 {
-                    Packet p = PacketConverter.BytesToPacket(b);
-                    if (p.IsErrorWhileReading)
-                    {
-                        ModemAPIDebugger.OutputDebugMessage("low latency modem received a corrupted packet");
-                        CallAllEventsOfCrc();
-                        return;
-                    }
-                    onReceive(p, k);
+                    // one handler parses each received packet once and hands it to every subscriber
+                    Communicator.OnDataRead(DispatchPacket);
+                    PacketDispatcherAttached = true;
                 }
-            });
+            }
+        }
+
+        public void DetachReceiveEventNoUnfragment(Action<Packet, Action> onReceive)
+        {
+            PacketSubscribers.Remove(onReceive);
+        }
+
+        private void DispatchPacket(byte[] b, Action k)
+        {
+            if (PacketSubscribers.Count == 0 || !PacketConverter.CheckIsPacket(b))
+            {
+                return;
+            }
+            Packet p = PacketConverter.BytesToPacket(b);
+            if (p.IsErrorWhileReading)
+            {
+                ModemAPIDebugger.OutputDebugMessage("low latency modem received a corrupted packet");
+                CallAllEventsOfCrc();
+                return;
+            }
+            PacketSubscribers.Invoke(p, k);
         }
 
         public bool IsAddressSMLA()

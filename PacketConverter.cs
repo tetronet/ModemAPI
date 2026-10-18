@@ -46,7 +46,7 @@ namespace ModemAPI
             packet.Transmitter = new(string.Join("-", transmitterAddressList.ToArray()));
             packet.DataBytes = [.. Convert.FromBase64String(message.package_data)];
             packet.Metadata = message.metadata;
-            packet.PacketNo = (byte)message.package_info.package_no;
+            packet.PacketNo = (ulong)message.package_info.package_no;
             packet.MessageId = (ulong)message.package_info.message_id;
             packet.RoutersToPass = message.package_info.max_hops ?? 65535;
             return packet;
@@ -323,7 +323,7 @@ namespace ModemAPI
         }
         public static bool CheckIsPacket(byte[] bytes)
         {
-            return bytes.Length > 8 && bytes.Take(4).SequenceEqual(CIoCILDefaultPhrases.PacketTransferHeader);
+            return bytes.Length > 8 && bytes.AsSpan(0, 4).SequenceEqual(CIoCILDefaultPhrases.PacketTransferHeader);
         }
         public static CIoCILLowLatShortConnectionRequestBody ParseLowLatencyConnectionRequest(byte[] request)
         {

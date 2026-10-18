@@ -63,9 +63,14 @@ namespace ModemAPI
             PacketQueues.TryGetValue(msgid, out PacketQueue? value);
             return value;
         }
-        public void RemovePacketQueue(ulong msgid)
+        /// <summary>
+        /// Removes a packet queue by Message ID.
+        /// </summary>
+        /// <param name="msgid">Message ID of the queue.</param>
+        /// <returns>true, if the queue was removed by this call, otherwise - false.</returns>
+        public bool RemovePacketQueue(ulong msgid)
         {
-            PacketQueues.TryRemove(msgid, out _);
+            return PacketQueues.TryRemove(msgid, out _);
         }
         private void TimeoutCheckerLoop()
         {
