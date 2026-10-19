@@ -53,7 +53,8 @@ LL-CIoCIL-mini - Low Latency Copybook Internet over Copybook Internet Lines mini
 CENP - Copybook Exchange Network Protocol\
 LMDTP - Large Message Direct Tunnel Protocol\
 SRTP - Simple Reliable Transmission Protocol\
-These are the protocols you actually want to know about, other protocols in this library are legacy/not used.
+These are the protocols you actually want to know about, other protocols in this library are legacy/not used.\\
+If you want to know exact exchanges used by the protocols, see PROTOCOLS.MD
 
 ### Things you'll need to do
 1) Install doghappy's SocketIOClient library
@@ -73,6 +74,9 @@ dotnet add package System.IO.Hashing
 You can create your own, or use one of mine for testing:
 - `wss://data-set.su:3000/` - is for Socket.IO connections
 - `ws://data-set.su:30000/` - is for Raw websocket connections
+
+### Project
+Originally it was made by me, but now I mostly use AI. But AI != crappy code. I check it VERY intensely, so don't worry about the stability. Maybe long-term stability is under question, although some of the tetronet apps are running for days and ain't failing/bugging out. Tetronet is designed for enterprise grade reliability. There's no warranty, but I'm trying to make it very reliable, since it's supposed to work for different loads and applications where there can be no access to different equipment and you really want this to just work without requiring a reboot twice a month.
 
 ### Supporting the project
 I don't know for to use donation services, just have fun and this will support me. Build you tetronet-compatible infrastructure, develop protocols, servers, clients, web-browsers, terminals, remote desktops and other stuff, I'm gonna appreciate that.
