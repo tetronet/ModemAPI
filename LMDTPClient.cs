@@ -1,9 +1,11 @@
 ﻿using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
+using System.IO.Hashing;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 
 namespace ModemAPI
@@ -23,14 +25,21 @@ namespace ModemAPI
         private bool IsReceivingData = false;
         private bool IsFirstPacket = true;
         private long TimestampLastPacket = 0;
-        private byte[] SHA512Received = new byte[64];
+        private byte[] ExpectedHash = new byte[64];
+        private LMDTPHashAlgorithms ResponseHashAlgorithm = LMDTPHashAlgorithms.Sha512;
         private long CurrentDownloadBytesInternal = 0;
         private long TotalDownloadBytesInternal = 0;
         private bool IsClosed = false;
         private Stream? CurrentDestinationStream = null;
-        private IncrementalHash hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA512);
+        private BackgroundHasher? Hasher = null;
+        private readonly ManualResetEventSlim ReceivingFinished = new(false);
         public long CurrentDownloadBytes { get { return CurrentDownloadBytesInternal; } }
         public long TotalDownloadBytes { get { return TotalDownloadBytesInternal; } }
+        /// <summary>
+        /// Hash algorithms this client offers to the server, the server picks the fastest one it can provide.
+        /// SHA-512 is always accepted, because servers that don't know about this choice always send it.
+        /// </summary>
+        public LMDTPHashAlgorithms SupportedHashAlgorithms { get; set; } = LMDTPHashAlgorithms.Sha512 | LMDTPHashAlgorithms.XxHash3;
         public LMDTPClient(IModem baseModem, Address dest, uint cid, int srtpTimeoutTicks)
         {
             UnderlyingClient = new(baseModem, dest, "lm_tunnel", cid, srtpTimeoutTicks);
@@ -72,6 +81,8 @@ namespace ModemAPI
             // 2 bytes length of the remote resource name
             // 0-65535 bytes remote resource name
             // 8 bytes maximum amount of bytes, that we could download
+            // 1 byte request type
+            // 1 byte supported hash algorithms (older servers ignore it and answer with SHA-512)
             try
             {
                 if (IsClosed)
@@ -84,14 +95,18 @@ namespace ModemAPI
                 {
                     throw new ArgumentOutOfRangeException(nameof(remoteResourceName), "the length of resource name after converting it into the UTF-8 must not exceed 65535 bytes");
                 }
-                Span<byte> request = new byte[2 + 2 + resourceNameByteLength + 8 + 1];
+                Span<byte> request = new byte[2 + 2 + resourceNameByteLength + 8 + 1 + 1];
                 BinaryPrimitives.WriteUInt16BigEndian(request, LMDTP_REQUEST_PREFIX); // protocol prefix
                 BinaryPrimitives.WriteUInt16BigEndian(request[2..], (ushort)resourceNameByteLength); // length of the resource name
                 Encoding.UTF8.GetBytes(remoteResourceName, request[4..]);
-                BinaryPrimitives.WriteInt64BigEndian(request[^9..], maxDownloadBytes);
-                request[^1] = (byte)rqType;
+                BinaryPrimitives.WriteInt64BigEndian(request[^10..], maxDownloadBytes);
+                request[^2] = (byte)rqType;
+                request[^1] = (byte)(SupportedHashAlgorithms | LMDTPHashAlgorithms.Sha512);
                 IsReceivingData = true;
                 IsFirstPacket = true;
+                Hasher?.Dispose();
+                Hasher = null; // created once the response tells which hash the server used
+                ReceivingFinished.Reset();
                 UnderlyingClient.OnMessageReceived += SRTPDataEvent;
                 UnderlyingModem.LowLevelTransmit(request.ToArray(), Destination, "lm_tunnel", ConnectionID);
                 TimestampLastPacket = DateTime.Now.Ticks;
@@ -101,7 +116,8 @@ namespace ModemAPI
                     {
                         throw new TimeoutException("LMDTP Obtain Request timed out...");
                     }
-                    Thread.Sleep(100);
+                    // returns as soon as the download is complete, the timeout is only for checking ticksTimeout
+                    ReceivingFinished.Wait(100);
                 }
             }
             finally
@@ -109,6 +125,8 @@ namespace ModemAPI
                 UnderlyingClient.OnMessageReceived -= SRTPDataEvent;
                 IsReceivingData = false;
                 IsFirstPacket = true;
+                Hasher?.Dispose();
+                Hasher = null;
             }
         }
         /// <summary>
@@ -170,30 +188,44 @@ namespace ModemAPI
                             ErrorOccured(new IOException("server's hard drive is physically or logically failed"));
                             return;
                         }
-                        // read checksum SHA-512
-                        SHA512Received = bytes.Slice(4, 64).ToArray();
+                        // read the hash: XxHash3 takes the first 8 bytes of the field, SHA-512 all 64
+                        if ((sFlags & (ushort)LMDTPResponseFlags.HashIsXxHash3) != 0)
+                        {
+                            ResponseHashAlgorithm = LMDTPHashAlgorithms.XxHash3;
+                            ExpectedHash = bytes.Slice(4, 8).ToArray();
+                        }
+                        else
+                        {
+                            ResponseHashAlgorithm = LMDTPHashAlgorithms.Sha512;
+                            ExpectedHash = bytes.Slice(4, 64).ToArray();
+                        }
+                        Hasher?.Dispose();
+                        Hasher = new BackgroundHasher(ResponseHashAlgorithm);
                         // allocate data and read it
                         long dataLength = BinaryPrimitives.ReadInt64BigEndian(bytes[68..]);
                         TotalDownloadBytesInternal = dataLength;
                         CurrentDestinationStream.Write(bytes[76..]);
-                        hasher.AppendData(bytes[76..]);
+                        Hasher.Append(bytes[76..].ToArray());
                         IsFirstPacket = false;
                     }
                     else
                     {
+                        BackgroundHasher hasher = Hasher ?? throw new InvalidOperationException("data arrived while no request is in progress");
                         CurrentDestinationStream.Write(bytes);
-                        hasher.AppendData(bytes);
+                        // SRTP gives every packet its own array, so it can be handed over without copying
+                        hasher.Append(data);
                         if (CurrentDestinationStream.Position == TotalDownloadBytes)
                         {
                             CurrentDestinationStream.Position = 0;
-                            if (hasher.GetHashAndReset().SequenceEqual(SHA512Received))
+                            if (hasher.Finish().SequenceEqual(ExpectedHash))
                             {
                                 IsFirstPacket = true;
                                 IsReceivingData = false;
+                                ReceivingFinished.Set();
                             }
                             else
                             {
-                                ErrorOccured(new InvalidDataException("SHA-512 is mismatched. Received data is corrupted and cannot be corrected."));
+                                ErrorOccured(new InvalidDataException($"{(ResponseHashAlgorithm == LMDTPHashAlgorithms.XxHash3 ? "XxHash3" : "SHA-512")} is mismatched. Received data is corrupted and cannot be corrected."));
                                 return;
                             }
                         }
@@ -205,6 +237,86 @@ namespace ModemAPI
             catch (Exception e)
             {
                 ErrorOccured(e);
+            }
+        }
+        /// <summary>
+        /// Computes the hash on its own thread, so hashing (SHA-512 does about 6 Gbit/s on one core) runs in parallel with receiving
+        /// instead of holding up the SRTP delivery thread. The queue is bounded: if hashing falls behind, <see cref="Append"/>
+        /// blocks, and the sender gets slowed down by SRTP flow control instead of the memory filling up.
+        /// </summary>
+        private sealed class BackgroundHasher : IDisposable
+        {
+            private readonly Channel<byte[]> Queue = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(64)
+            {
+                SingleReader = true,
+                SingleWriter = true,
+                FullMode = BoundedChannelFullMode.Wait
+            });
+            private readonly IncrementalHash? Sha512;
+            private readonly XxHash3? XxHash3;
+            private readonly Task Worker;
+
+            public BackgroundHasher(LMDTPHashAlgorithms algorithm)
+            {
+                if (algorithm == LMDTPHashAlgorithms.XxHash3)
+                {
+                    XxHash3 = new XxHash3();
+                }
+                else
+                {
+                    Sha512 = IncrementalHash.CreateHash(HashAlgorithmName.SHA512);
+                }
+                Worker = Task.Run(Run);
+            }
+
+            private async Task Run()
+            {
+                await foreach (byte[] chunk in Queue.Reader.ReadAllAsync())
+                {
+                    if (XxHash3 != null)
+                    {
+                        XxHash3.Append(chunk);
+                    }
+                    else
+                    {
+                        Sha512!.AppendData(chunk);
+                    }
+                }
+            }
+
+            /// <summary>
+            /// Queues data for hashing. The array must not be changed afterwards.
+            /// </summary>
+            public void Append(byte[] chunk)
+            {
+                if (!Queue.Writer.TryWrite(chunk))
+                {
+                    Queue.Writer.WriteAsync(chunk).AsTask().GetAwaiter().GetResult();
+                }
+            }
+
+            /// <summary>
+            /// Waits for everything queued to be hashed and returns the hash.
+            /// </summary>
+            public byte[] Finish()
+            {
+                Queue.Writer.TryComplete();
+                Worker.GetAwaiter().GetResult();
+                return XxHash3 != null ? XxHash3.GetHashAndReset() : Sha512!.GetHashAndReset();
+            }
+
+            public void Dispose()
+            {
+                Queue.Writer.TryComplete();
+                try
+                {
+                    Worker.Wait();
+                }
+                catch (AggregateException)
+                {
+                    // the result isn't needed anymore
+                }
+                Sha512?.Dispose();
             }
         }
     }

@@ -2,6 +2,7 @@
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.IO;
+using System.IO.Hashing;
 using System.Security.Cryptography;
 using System.Text;
 using System.Xml;
@@ -30,9 +31,10 @@ namespace ModemAPI
         /// </summary>
         public event Action<Exception> ErrorOccured = delegate { };
         /// <summary>
-        /// Gets or sets maximum length of the packet used in response transmission (default is 8000).
+        /// Gets or sets maximum length of the packet used in response transmission (default is 59992, the most an SRTP packet can carry).
+        /// Bigger packets mean fewer packets and acknowledgements per byte, which is what limits the speed.
         /// </summary>
-        public int PacketMaxLength = 8000;
+        public int PacketMaxLength = 59992;
         /// <summary>
         /// When a new reliable client appears.
         /// </summary>
@@ -111,18 +113,37 @@ namespace ModemAPI
         {
             return GrayList.Contains(address) == IsListBlackOrWhite;
         }
-        private byte[] ConstructResponseHeader(LMDTPResponseFlags? flags, long? reslen, byte[]? sha512)
+        private byte[] ConstructResponseHeader(LMDTPResponseFlags? flags, long? reslen, byte[]? hash)
         {
             Span<byte> bytes = stackalloc byte[76];
             BinaryPrimitives.WriteUInt16BigEndian(bytes, LMDTPClient.LMDTP_RESPONSE_PREFIX);
             BinaryPrimitives.WriteUInt16BigEndian(bytes[2..], (ushort)(flags ?? LMDTPResponseFlags.ServerSideError));
-            sha512?.AsSpan().CopyTo(bytes[4..]);
-            if (sha512 == null)
-            {
-                bytes.Slice(4, 64).Clear();
-            }
+            // the hash field is 64 bytes: SHA-512 fills it, shorter hashes take its beginning and the rest stays zero
+            bytes.Slice(4, 64).Clear();
+            hash?.AsSpan(0, Math.Min(hash.Length, 64)).CopyTo(bytes[4..]);
             BinaryPrimitives.WriteInt64BigEndian(bytes[68..], reslen ?? 0);
             return bytes.ToArray();
+        }
+        /// <summary>
+        /// Computes the hash of a resource the way LMDTP sends it, for <see cref="IResourceProvider.GetResourceHash"/> implementations.
+        /// Reads the stream to its end.
+        /// </summary>
+        /// <param name="resource">Resource data</param>
+        /// <param name="algorithm">One of the algorithms</param>
+        /// <returns>The hash: 64 bytes for SHA-512, 8 bytes (big-endian) for XxHash3</returns>
+        public static byte[] ComputeResourceHash(Stream resource, LMDTPHashAlgorithms algorithm)
+        {
+            if (algorithm == LMDTPHashAlgorithms.Sha512)
+            {
+                return SHA512.HashData(resource);
+            }
+            if (algorithm == LMDTPHashAlgorithms.XxHash3)
+            {
+                XxHash3 hash = new();
+                hash.Append(resource);
+                return hash.GetCurrentHash();
+            }
+            throw new ArgumentOutOfRangeException(nameof(algorithm), "exactly one supported algorithm must be given");
         }
         private void HandleClient(Address transmitter, uint connectid, byte[] data)
         {
@@ -143,6 +164,10 @@ namespace ModemAPI
                         ushort resourceNameLength = BinaryPrimitives.ReadUInt16BigEndian(bytes[2..]);
                         string resourceName = Encoding.UTF8.GetString(bytes.Slice(4, resourceNameLength));
                         LMDTPRequestType requestType = (LMDTPRequestType)bytes[2 + 2 + resourceNameLength + 8];
+                        // newer clients append a byte with the hash algorithms they support, older ones support only SHA-512
+                        LMDTPHashAlgorithms clientHashes = bytes.Length > 2 + 2 + resourceNameLength + 8 + 1
+                            ? (LMDTPHashAlgorithms)bytes[2 + 2 + resourceNameLength + 8 + 1]
+                            : LMDTPHashAlgorithms.Sha512;
                         if (ResourceProvider?.GetResourceSize(resourceName) > BinaryPrimitives.ReadInt64BigEndian(bytes[(2 + 2 + resourceNameLength)..]))
                         {
                             tempClient.Transmit(ConstructResponseHeader(LMDTPResponseFlags.LargeMessageExceededMTU, 0, new byte[64]));
@@ -164,8 +189,18 @@ namespace ModemAPI
                                     ErrorOccured(new ArgumentNullException(nameof(stream), "Resource Provider must return a valid non-null stream object"));
                                     return;
                                 }
-                                tempClient.Transmit(ConstructResponseHeader(ResourceProvider?.GetResourceResponseFlags(resourceName), ResourceProvider?.GetResourceSize(resourceName), ResourceProvider?.GetResourceSha512Hashsum(resourceName)));
-                                Span<byte> packetBuffer = new byte[PacketMaxLength];
+                                LMDTPResponseFlags? responseFlags = ResourceProvider?.GetResourceResponseFlags(resourceName);
+                                byte[]? resourceHash = null;
+                                if ((clientHashes & LMDTPHashAlgorithms.XxHash3) != 0)
+                                {
+                                    resourceHash = ResourceProvider?.GetResourceHash(resourceName, LMDTPHashAlgorithms.XxHash3);
+                                    if (resourceHash != null)
+                                    {
+                                        responseFlags |= LMDTPResponseFlags.HashIsXxHash3;
+                                    }
+                                }
+                                resourceHash ??= ResourceProvider?.GetResourceSha512Hashsum(resourceName);
+                                tempClient.Transmit(ConstructResponseHeader(responseFlags, ResourceProvider?.GetResourceSize(resourceName), resourceHash));
                                 byte[] buffer = new byte[PacketMaxLength];
                                 int bytesRead;
                                 while ((bytesRead = stream.Read(buffer, 0, buffer.Length)) > 0)
@@ -198,6 +233,8 @@ namespace ModemAPI
                         //Console.WriteLine("Currently there are clients: " + Clients.Count);
                         //Console.WriteLine("LMDTP server closed");
                         stream?.Dispose();
+                        // with a big window a lot of data may still be unacknowledged, and closing now would stop its retransmission
+                        tempClient.WaitForAcknowledgements();
                         tempClient.Close();
                         Clients.TryRemove((transmitter, connectid), out _);
                         //Console.WriteLine("And now there's clients: " + Clients.Count);

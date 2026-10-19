@@ -7,7 +7,9 @@
     {
         public Packet()
         {
-            
+            // set here instead of field initializers, so the other constructor doesn't allocate addresses it overwrites right away
+            Transmitter = new Address();
+            Receiver = new Address();
         }
         public Packet(Address tx,
             Address rx,
@@ -36,11 +38,11 @@
         /// <summary>
         /// TetroNet subscriber address, that transmitted this instance of packet.
         /// </summary>
-        public Address Transmitter = new Address();
+        public Address Transmitter;
         /// <summary>
         /// TetroNet subscriber address, that is going to receive this instance of packet.
         /// </summary>
-        public Address Receiver = new Address();
+        public Address Receiver;
         /// <summary>
         /// Data of the packet, that was transferred in it.
         /// </summary>

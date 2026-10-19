@@ -1,5 +1,7 @@
 ﻿using System;
+using System.Buffers;
 using System.Buffers.Binary;
+using System.Buffers.Text;
 using System.IO.Hashing;
 using System.Text;
 
@@ -7,6 +9,22 @@ namespace ModemAPI
 {
     public class PacketConverter
     {
+        /// <summary>
+        /// Bytes of a binary packet that don't depend on its contents: header (4), lengths of receiver, transmitter and
+        /// query type (1 + 1 + 1), connection ID (4), last-in-sequence flag (1), packet No. (8), message ID (8), TTL (2),
+        /// data length (2), metadata length (2) and CRC-32 (4).
+        /// </summary>
+        private const int FixedPacketSize = 4 + 1 + 1 + 1 + 4 + 1 + 8 + 8 + 2 + 2 + 2 + 4;
+        /// <summary>
+        /// Lookup table for <see cref="PrintableCharacterList.PrintableCharacters"/>, indexed by byte value.
+        /// </summary>
+        private static readonly bool[] MetadataByteAllowed = BuildMetadataTable();
+        // The same addresses and query types arrive in packet after packet, so the last decoded strings are reused
+        // instead of allocating new ones. Strings are immutable, so sharing them between packets is safe.
+        [ThreadStatic] private static string? LastReceiver;
+        [ThreadStatic] private static string? LastTransmitter;
+        [ThreadStatic] private static string? LastQueryType;
+
         public static Packet WebSocketMessageToPacket(WebSocketMessage message)
         {
             if (message.package_info == null
@@ -22,42 +40,22 @@ namespace ModemAPI
                 return Packet.Static.ErroredPacket;
                 //throw new ArgumentNullException(nameof(message), "websocket message must nothave null in all fields except metadata");
             }
-            Packet packet = new();
-            packet.ConnectionID = (uint)message.package_info.connectionid;
-            packet.IsLastInSequence = (bool)message.package_info.is_last_in_package_queue;
-            packet.QueryType = message.package_info.package_type;
-            List<string?> receiverAddressList = new();
-            List<string?> transmitterAddressList = new();
-            foreach (object o in message.package_info.to)
-            {
-                if (o.ToString() != null)
-                {
-                    receiverAddressList.Add(o.ToString());
-                }
-            }
-            foreach (object o in message.package_info.from)
-            {
-                if (o.ToString() != null)
-                {
-                    transmitterAddressList.Add(o.ToString());
-                }
-            }
-            packet.Receiver = new(string.Join("-", receiverAddressList.ToArray()));
-            packet.Transmitter = new(string.Join("-", transmitterAddressList.ToArray()));
-            packet.DataBytes = [.. Convert.FromBase64String(message.package_data)];
-            packet.Metadata = message.metadata;
-            packet.PacketNo = (ulong)message.package_info.package_no;
-            packet.MessageId = (ulong)message.package_info.message_id;
-            packet.RoutersToPass = message.package_info.max_hops ?? 65535;
-            return packet;
+            return new Packet(
+                new Address(JoinAddressParts(message.package_info.from)),
+                new Address(JoinAddressParts(message.package_info.to)),
+                DecodeBase64(message.package_data),
+                (bool)message.package_info.is_last_in_package_queue,
+                message.metadata,
+                message.package_info.package_type,
+                (uint)message.package_info.connectionid,
+                false,
+                (ulong)message.package_info.package_no,
+                (ulong)message.package_info.message_id,
+                message.package_info.max_hops ?? 65535);
         }
 
         public static WebSocketMessage PacketToWebSocketMessage(Packet packet)
         {
-            WebSocketMessage message = new();
-            message.package_data = Convert.ToBase64String(packet.DataBytes.ToArray());
-            message.metadata = packet.Metadata;
-            message.package_info = new();
             if (packet.Receiver.AddressValue == null)
             {
                 throw new NullAddressException("receiver address null");
@@ -66,8 +64,12 @@ namespace ModemAPI
             {
                 throw new NullAddressException("transmitter address null");
             }
-            message.package_info.to = [.. packet.Receiver.AddressValue.Split('-').Cast<object>()];
-            message.package_info.from = [.. packet.Transmitter.AddressValue.Split('-').Cast<object>()];
+            WebSocketMessage message = new();
+            message.package_data = Convert.ToBase64String(packet.DataBytes);
+            message.metadata = packet.Metadata;
+            message.package_info = new();
+            message.package_info.to = new List<object>(packet.Receiver.AddressValue.Split('-'));
+            message.package_info.from = new List<object>(packet.Transmitter.AddressValue.Split('-'));
             message.package_info.is_last_in_package_queue = packet.IsLastInSequence;
             message.package_info.connectionid = packet.ConnectionID;
             message.package_info.package_type = packet.QueryType;
@@ -89,188 +91,294 @@ namespace ModemAPI
             return Encoding.UTF8.GetString(base64EncodedBytes);
         }
 
-        public static Packet BytesToPacket(byte[] bytes_)
+        public static Packet BytesToPacket(byte[] bytes)
         {
-            ReadOnlySpan<byte> bytes = bytes_;
-            int offset = 0;
+            return BytesToPacket(bytes.AsSpan());
+        }
+
+        public static Packet BytesToPacket(ReadOnlySpan<byte> bytes)
+        {
             if (bytes.Length < 8)
             {
                 return Packet.Static.ErroredPacket;
             }
-            Packet prepare = new();
-            bool success = false;
-            ReadOnlySpan<byte> remoteHash = bytes.Slice(bytes.Length - 4, 4);
-            ReadOnlySpan<byte> localHash = Crc32.Hash(bytes.Slice(0, bytes.Length - 4));
-            if (bytes.Slice(offset, 4).SequenceEqual(CIoCILDefaultPhrases.PacketTransferHeader) && localHash.SequenceEqual(remoteHash))
+            if (!bytes[..4].SequenceEqual(CIoCILDefaultPhrases.PacketTransferHeader) ||
+                Crc32.HashToUInt32(bytes[..^4]) != BinaryPrimitives.ReadUInt32LittleEndian(bytes[^4..]))
             {
-                offset += 4;
-                ModemAPIDebugger.OutputDebugMessage("Converting the packet to byte[] at 94 line in PacketConverter.cs");
-                // Get receiver address for packet
-                byte addressReceiverLength = bytes[offset];
-                offset += 1;
-                ReadOnlySpan<byte> addressReceiver = bytes.Slice(offset, addressReceiverLength);
-                offset += addressReceiverLength;
-                // Get transmitter address for packet
-                byte addressTransmitterLength = bytes[offset];
-                offset += 1;
-                ReadOnlySpan<byte> addressTransmitter = bytes.Slice(offset, addressTransmitterLength);
-                offset += addressTransmitterLength;
-                // Get query type for packet
-                byte queryTypeLength = bytes[offset];
-                offset += 1;
-                ReadOnlySpan<byte> queryType = bytes.Slice(offset, queryTypeLength);
-                offset += queryTypeLength;
-                // Get connection ID for packet
-                ReadOnlySpan<byte> connectid = bytes.Slice(offset, 4);
-                offset += 4;
-                // Get is last in packet sequence address for packet
-                byte isLastInPacketSequence = bytes[offset];
-                offset += 1;
-                // Get packet transmission No.
-                ulong transmissionNo_ = BinaryPrimitives.ReadUInt64BigEndian(bytes.Slice(offset));
-                offset += 8;
-                // Get packet message id
-                ulong messageId_ = BinaryPrimitives.ReadUInt64BigEndian(bytes.Slice(offset));
-                offset += 8;
-                // Get packet TTL
-                ushort ttl_ = BinaryPrimitives.ReadUInt16BigEndian(bytes.Slice(offset));
-                offset += 2;
-                // Get data for packet
-                ushort packetDataLength = BinaryPrimitives.ReadUInt16BigEndian(bytes.Slice(offset));
-                offset += 2;
-                ReadOnlySpan<byte> packetData = bytes.Slice(offset, packetDataLength);
-                offset += packetDataLength;
-                // Get metadata for packet
-                ushort packetMetadataLength = BinaryPrimitives.ReadUInt16BigEndian(bytes.Slice(offset));
-                offset += 2;
-                ReadOnlySpan<byte> packetMetadata = bytes.Slice(offset, packetMetadataLength);
-                offset += packetMetadataLength;
-                // Preparing data for out brand new packet
-                Address addressReceiver_ = new(Encoding.ASCII.GetString(addressReceiver));
-                Address addressTransmitter_ = new(Encoding.ASCII.GetString(addressTransmitter));
-                string queryType_ = Encoding.ASCII.GetString(queryType);
-                uint connectid_ = BinaryPrimitives.ReadUInt32BigEndian(connectid);
-                bool isLastInPacketSequence_;
-                if (isLastInPacketSequence == CIoCILDefaultPhrases.CIoCILTrue[0])
-                {
-                    isLastInPacketSequence_ = true;
-                }
-                else if (isLastInPacketSequence == CIoCILDefaultPhrases.CIoCILFalse[0])
-                {
-                    isLastInPacketSequence_ = false;
-                }
-                else
-                {
-                    return Packet.Static.ErroredPacket;
-                }
-                byte[] packetDataBytes_ = [.. packetData];
-                string packetMetadata_ = Encoding.ASCII.GetString(packetMetadata);
-                foreach (char c in packetMetadata_)
-                {
-                    if (PrintableCharacterList.IsCharacherWrong(c))
-                    {
-                        throw new WrongCharacherException("metadata must follow valid charlist");
-                    }
-                }
-                // Move all of the readen data to the preparing packet
-                prepare.Receiver = addressReceiver_;
-                prepare.Transmitter = addressTransmitter_;
-                prepare.QueryType = queryType_;
-                prepare.ConnectionID = connectid_;
-                prepare.IsLastInSequence = isLastInPacketSequence_;
-                prepare.DataBytes = packetDataBytes_;
-                prepare.Metadata = packetMetadata_;
-                prepare.PacketNo = transmissionNo_;
-                prepare.MessageId = messageId_;
-                prepare.RoutersToPass = ttl_;
-                success = true;
-                ModemAPIDebugger.OutputDebugMessage("==== [at PacketConverter.cs at line 170] ====");
-                ModemAPIDebugger.PrintOutPacket(prepare);
+                return new Packet { IsErrorWhileReading = true };
             }
-            prepare.IsErrorWhileReading = !success;
+            int offset = 4;
+            ModemAPIDebugger.OutputDebugMessage("Converting the packet to byte[] at 94 line in PacketConverter.cs");
+            // Get receiver address for packet
+            byte addressReceiverLength = bytes[offset];
+            offset += 1;
+            ReadOnlySpan<byte> addressReceiver = bytes.Slice(offset, addressReceiverLength);
+            offset += addressReceiverLength;
+            // Get transmitter address for packet
+            byte addressTransmitterLength = bytes[offset];
+            offset += 1;
+            ReadOnlySpan<byte> addressTransmitter = bytes.Slice(offset, addressTransmitterLength);
+            offset += addressTransmitterLength;
+            // Get query type for packet
+            byte queryTypeLength = bytes[offset];
+            offset += 1;
+            ReadOnlySpan<byte> queryType = bytes.Slice(offset, queryTypeLength);
+            offset += queryTypeLength;
+            // Get connection ID for packet
+            uint connectid = BinaryPrimitives.ReadUInt32BigEndian(bytes.Slice(offset, 4));
+            offset += 4;
+            // Get is last in packet sequence address for packet
+            byte isLastInPacketSequence = bytes[offset];
+            offset += 1;
+            // Get packet transmission No.
+            ulong transmissionNo = BinaryPrimitives.ReadUInt64BigEndian(bytes.Slice(offset));
+            offset += 8;
+            // Get packet message id
+            ulong messageId = BinaryPrimitives.ReadUInt64BigEndian(bytes.Slice(offset));
+            offset += 8;
+            // Get packet TTL
+            ushort ttl = BinaryPrimitives.ReadUInt16BigEndian(bytes.Slice(offset));
+            offset += 2;
+            // Get data for packet
+            ushort packetDataLength = BinaryPrimitives.ReadUInt16BigEndian(bytes.Slice(offset));
+            offset += 2;
+            ReadOnlySpan<byte> packetData = bytes.Slice(offset, packetDataLength);
+            offset += packetDataLength;
+            // Get metadata for packet
+            ushort packetMetadataLength = BinaryPrimitives.ReadUInt16BigEndian(bytes.Slice(offset));
+            offset += 2;
+            ReadOnlySpan<byte> packetMetadata = bytes.Slice(offset, packetMetadataLength);
+            bool isLastInPacketSequence_;
+            if (isLastInPacketSequence == CIoCILDefaultPhrases.CIoCILTrue[0])
+            {
+                isLastInPacketSequence_ = true;
+            }
+            else if (isLastInPacketSequence == CIoCILDefaultPhrases.CIoCILFalse[0])
+            {
+                isLastInPacketSequence_ = false;
+            }
+            else
+            {
+                return Packet.Static.ErroredPacket;
+            }
+            foreach (byte b in packetMetadata)
+            {
+                if (!MetadataByteAllowed[b])
+                {
+                    throw new WrongCharacherException("metadata must follow valid charlist");
+                }
+            }
+            Packet prepare = new(
+                new Address(GetAsciiString(addressTransmitter, ref LastTransmitter)),
+                new Address(GetAsciiString(addressReceiver, ref LastReceiver)),
+                packetData.ToArray(),
+                isLastInPacketSequence_,
+                Encoding.ASCII.GetString(packetMetadata),
+                GetAsciiString(queryType, ref LastQueryType),
+                connectid,
+                false,
+                transmissionNo,
+                messageId,
+                ttl);
+            ModemAPIDebugger.OutputDebugMessage("==== [at PacketConverter.cs at line 170] ====");
+            ModemAPIDebugger.PrintOutPacket(prepare);
             return prepare;
+        }
+
+        /// <summary>
+        /// Calculates the exact length of the packet after converting it with <see cref="PacketToBytes(Packet)"/>.
+        /// </summary>
+        /// <param name="packet">Packet to measure</param>
+        /// <returns>Length of the binary packet in bytes</returns>
+        /// <exception cref="NullAddressException">Receiver or transmitter address is null</exception>
+        /// <exception cref="ArgumentOutOfRangeException">Some field of the packet doesn't fit into the binary format</exception>
+        public static int EstimatePacketSize(Packet packet)
+        {
+            string receiver = packet.Receiver?.AddressValue ?? throw new NullAddressException("packet address receiver null");
+            string transmitter = packet.Transmitter?.AddressValue ?? throw new NullAddressException("packet address transmitter null");
+            int receiverLength = AsciiByteCount(receiver);
+            int transmitterLength = AsciiByteCount(transmitter);
+            int queryTypeLength = AsciiByteCount(packet.QueryType);
+            int metadataLength = packet.Metadata == null ? 0 : AsciiByteCount(packet.Metadata);
+            if (receiverLength > byte.MaxValue || transmitterLength > byte.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(packet), "packet address must not be longer than 255 characters");
+            if (queryTypeLength > byte.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(packet), "packet query type must not be longer than 255 characters");
+            if (packet.DataBytes.Length > ushort.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(packet), "packet data too large");
+            if (metadataLength > ushort.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(packet), "packet metadata too large");
+            return FixedPacketSize + receiverLength + transmitterLength + queryTypeLength + packet.DataBytes.Length + metadataLength;
         }
 
         public static byte[] PacketToBytes(Packet packet)
         {
-            if (packet.Receiver?.AddressValue == null)
-                throw new NullAddressException("packet address receiver null");
+            int size = EstimatePacketSize(packet);
+            // every byte gets written below, so there's no need to zero the array first
+            byte[] result = GC.AllocateUninitializedArray<byte>(size);
+            WritePacket(packet, result);
+            return result;
+        }
 
-            if (packet.Transmitter?.AddressValue == null)
-                throw new NullAddressException("packet address transmitter null");
+        /// <summary>
+        /// Converts the packet into the binary format, writing it into a buffer supplied by the caller (for example a pooled one).
+        /// </summary>
+        /// <param name="packet">Packet to convert</param>
+        /// <param name="destination">Buffer, that must be at least <see cref="EstimatePacketSize(Packet)"/> bytes long</param>
+        /// <returns>How many bytes were written</returns>
+        /// <exception cref="ArgumentException">The buffer is too small</exception>
+        public static int PacketToBytes(Packet packet, Span<byte> destination)
+        {
+            int size = EstimatePacketSize(packet);
+            if (destination.Length < size)
+            {
+                throw new ArgumentException($"destination must be at least {size} bytes long", nameof(destination));
+            }
+            WritePacket(packet, destination[..size]);
+            return size;
+        }
 
-            var buffer = new List<byte>(1600);
-
+        /// <summary>
+        /// Writes the packet into a buffer of exactly <see cref="EstimatePacketSize(Packet)"/> bytes.
+        /// </summary>
+        private static void WritePacket(Packet packet, Span<byte> destination)
+        {
             // Header
-            buffer.AddRange(CIoCILDefaultPhrases.PacketTransferHeader);
-
-            // Receiver
-            byte[] receiverBytes = Encoding.ASCII.GetBytes(packet.Receiver.AddressValue);
-            buffer.Add((byte)receiverBytes.Length);
-            buffer.AddRange(receiverBytes);
-
-            // Transmitter
-            byte[] transmitterBytes = Encoding.ASCII.GetBytes(packet.Transmitter.AddressValue);
-            buffer.Add((byte)transmitterBytes.Length);
-            buffer.AddRange(transmitterBytes);
-
-            // Query type
-            byte[] queryBytes = Encoding.ASCII.GetBytes(packet.QueryType);
-            buffer.Add((byte)queryBytes.Length);
-            buffer.AddRange(queryBytes);
-
+            CIoCILDefaultPhrases.PacketTransferHeader.CopyTo(destination);
+            int offset = 4;
+            // Receiver, transmitter and query type, each prefixed with its length
+            offset += WriteShortAscii(packet.Receiver.AddressValue!, destination[offset..]);
+            offset += WriteShortAscii(packet.Transmitter.AddressValue!, destination[offset..]);
+            offset += WriteShortAscii(packet.QueryType, destination[offset..]);
             // Connection ID
-            Span<byte> connectionBytes = stackalloc byte[4];
-            BinaryPrimitives.WriteUInt32BigEndian(connectionBytes, packet.ConnectionID);
-            buffer.AddRange(connectionBytes);
-
+            BinaryPrimitives.WriteUInt32BigEndian(destination[offset..], packet.ConnectionID);
+            offset += 4;
             // Flags
-            buffer.Add(packet.IsLastInSequence
+            destination[offset] = packet.IsLastInSequence
                 ? CIoCILDefaultPhrases.CIoCILTrue[0]
-                : CIoCILDefaultPhrases.CIoCILFalse[0]);
-
+                : CIoCILDefaultPhrases.CIoCILFalse[0];
+            offset += 1;
             // Packet No
-            Span<byte> pn = stackalloc byte[8];
-            BinaryPrimitives.WriteUInt64BigEndian(pn, packet.PacketNo);
-            buffer.AddRange(pn);
-
+            BinaryPrimitives.WriteUInt64BigEndian(destination[offset..], packet.PacketNo);
+            offset += 8;
             // Message ID
-            Span<byte> mid = stackalloc byte[8];
-            BinaryPrimitives.WriteUInt64BigEndian(mid, packet.MessageId);
-            buffer.AddRange(mid);
-
+            BinaryPrimitives.WriteUInt64BigEndian(destination[offset..], packet.MessageId);
+            offset += 8;
             // ttl
-            Span<byte> ttl = stackalloc byte[2];
-            BinaryPrimitives.WriteUInt16BigEndian(ttl, packet.RoutersToPass);
-            buffer.AddRange(ttl);
-
+            BinaryPrimitives.WriteUInt16BigEndian(destination[offset..], packet.RoutersToPass);
+            offset += 2;
             // Data
-            if (packet.DataBytes.Length > ushort.MaxValue)
-                throw new ArgumentOutOfRangeException(nameof(packet), "packet data too large");
-
-            Span<byte> dataLengthBytes = stackalloc byte[2];
-            BinaryPrimitives.WriteUInt16BigEndian(dataLengthBytes, (ushort)packet.DataBytes.Length);
-            buffer.AddRange(dataLengthBytes);
-            buffer.AddRange(packet.DataBytes);
-
+            BinaryPrimitives.WriteUInt16BigEndian(destination[offset..], (ushort)packet.DataBytes.Length);
+            offset += 2;
+            packet.DataBytes.CopyTo(destination[offset..]);
+            offset += packet.DataBytes.Length;
             // Metadata
-            byte[] metadataBytes = packet.Metadata != null
-                ? Encoding.ASCII.GetBytes(packet.Metadata)
-                : [];
+            int metadataLength = packet.Metadata == null ? 0 : Encoding.ASCII.GetBytes(packet.Metadata, destination[(offset + 2)..]);
+            BinaryPrimitives.WriteUInt16BigEndian(destination[offset..], (ushort)metadataLength);
+            offset += 2 + metadataLength;
+            // CRC, in the same byte order as Crc32.Hash() produces it
+            BinaryPrimitives.WriteUInt32LittleEndian(destination[offset..], Crc32.HashToUInt32(destination[..offset]));
+        }
 
-            if (metadataBytes.Length > ushort.MaxValue)
-                throw new ArgumentOutOfRangeException("packet metadata too large");
+        /// <summary>
+        /// Writes a length byte followed by the ASCII bytes of the string.
+        /// </summary>
+        /// <returns>How many bytes were written</returns>
+        private static int WriteShortAscii(string value, Span<byte> destination)
+        {
+            int length = Encoding.ASCII.GetBytes(value, destination[1..]);
+            destination[0] = (byte)length;
+            return length + 1;
+        }
 
-            Span<byte> metadataLengthBytes = stackalloc byte[2];
-            BinaryPrimitives.WriteUInt16BigEndian(metadataLengthBytes, (ushort)metadataBytes.Length);
-            buffer.AddRange(metadataLengthBytes);
-            buffer.AddRange(metadataBytes);
+        private static int AsciiByteCount(string value)
+        {
+            // pure ASCII is one byte per char; anything else goes through the encoder, which may merge surrogate pairs into one '?'
+            return Ascii.IsValid(value) ? value.Length : Encoding.ASCII.GetByteCount(value);
+        }
 
-            // CRC
-            byte[] crc = Crc32.Hash(buffer.ToArray());
-            buffer.AddRange(crc);
+        private static string GetAsciiString(ReadOnlySpan<byte> bytes, ref string? cache)
+        {
+            string? cached = cache;
+            if (cached != null && cached.Length == bytes.Length && Ascii.Equals(bytes, cached))
+            {
+                return cached;
+            }
+            string value = Encoding.ASCII.GetString(bytes);
+            cache = value;
+            return value;
+        }
 
-            return buffer.ToArray();
+        /// <summary>
+        /// Same result as <see cref="Convert.FromBase64String(string)"/>, but uses the vectorized UTF-8 decoder for the usual
+        /// canonical input and leaves everything else (whitespace, wrong length, invalid characters) to Convert.
+        /// </summary>
+        private static byte[] DecodeBase64(string base64)
+        {
+            int length = base64.Length;
+            if (length == 0 || length % 4 != 0 || length > 1 << 20)
+            {
+                return Convert.FromBase64String(base64);
+            }
+            int padding = base64[^1] == '=' ? (base64[^2] == '=' ? 2 : 1) : 0;
+            byte[] result = new byte[length / 4 * 3 - padding];
+            byte[]? rented = null;
+            Span<byte> utf8 = length <= 4096 ? stackalloc byte[length] : (rented = ArrayPool<byte>.Shared.Rent(length)).AsSpan(0, length);
+            try
+            {
+                // base64 is plain ASCII, so narrowing the chars gives its UTF-8 form; anything non-ASCII fails below anyway
+                if (Ascii.FromUtf16(base64, utf8, out _) == OperationStatus.Done &&
+                    Base64.DecodeFromUtf8(utf8, result, out _, out int written) == OperationStatus.Done &&
+                    written == result.Length)
+                {
+                    return result;
+                }
+                return Convert.FromBase64String(base64);
+            }
+            finally
+            {
+                if (rented != null)
+                {
+                    ArrayPool<byte>.Shared.Return(rented);
+                }
+            }
+        }
+
+        private static string JoinAddressParts(List<object> parts)
+        {
+            if (parts.Count == 1)
+            {
+                return parts[0].ToString() ?? "";
+            }
+            string[] values = new string[parts.Count];
+            int count = 0;
+            foreach (object part in parts)
+            {
+                string? value = part.ToString();
+                if (value != null)
+                {
+                    values[count++] = value;
+                }
+            }
+            return string.Join('-', values, 0, count);
+        }
+
+        private static bool[] BuildMetadataTable()
+        {
+            bool[] table = new bool[256];
+            foreach (char c in PrintableCharacterList.PrintableCharacters)
+            {
+                if (c < 128)
+                {
+                    table[c] = true;
+                }
+            }
+            // Encoding.ASCII decodes every byte above 0x7F as '?'
+            for (int b = 128; b < 256; b++)
+            {
+                table[b] = !PrintableCharacterList.IsCharacherWrong('?');
+            }
+            return table;
         }
 
         public static CIoCILLowLatShortResponseBody ParseLowLatencyConnectionResponse(byte[] response)

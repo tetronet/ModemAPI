@@ -6,17 +6,36 @@ namespace ModemAPI
 {
     public class SRTPClient
     {
+        /// <summary>
+        /// Metadata of data packets sent by clients that understand batched acknowledgements. Older clients ignore metadata,
+        /// so they keep receiving data as before and keep acknowledging every packet.
+        /// </summary>
+        private const string BatchedAckDataTag = "srtp2";
+        /// <summary>
+        /// Metadata of a batched acknowledgement: 8 bytes "every packet up to this number is delivered", followed by an
+        /// optional bitmap of packets received after it (bit i = packet number + 1 + i). It is only sent to peers, whose data carried <see cref="BatchedAckDataTag"/>.
+        /// </summary>
+        private const string BatchedAckTag = "srtp2a";
+        private const int SelectiveAckBits = 256;
         private Address? CommunicatingWith = null;
         private uint ConnectionID = 0;
         private string QueryType = "";
         private IModem Modem;
-        private long LastReceived = -1;
+        private long LastReceived = -1; // every packet up to this one is delivered to OnMessageReceived
+        private long HighestContiguousReceived = -1; // every packet up to this one is received (delivered or waiting in ReorderingBuffer)
         private long SequentialPacketNumber = 0;
-        private bool IsClosed = false;
+        private long LowestUnacknowledged = 0; // sender side: packets below this one are acknowledged
+        private volatile bool IsClosed = false;
         private int TicksTimeout;
-        private HashSet<long> ReceivedNumbers = new HashSet<long>();
         private ConcurrentDictionary<long, byte[]> ReorderingBuffer = new ConcurrentDictionary<long, byte[]>();
         private ConcurrentDictionary<long, ReliablePacketInformation> InternalState = new ConcurrentDictionary<long, ReliablePacketInformation>();
+        private readonly Lock ReceiveLock = new();
+        private readonly Lock AcknowledgementLock = new();
+        private readonly object WindowLock = new();
+        private bool PeerUsesBatchedAcks = false;
+        private int UnacknowledgedPackets = 0; // delivered from a batched-ack peer, but not acknowledged yet
+        private int OutOfOrderSinceAcknowledgement = 0; // received after a gap since the last acknowledgement
+        private long FirstUnacknowledgedTimestamp = 0;
         private long NextSendTimestamp = 0;
         private readonly Lock PacingLock = new();
         private readonly SemaphoreSlim ReorderSignal = new(0, 1);
@@ -48,13 +67,27 @@ namespace ModemAPI
         /// </summary>
         public Action<long> OnOutOfOrderPacketReceived = delegate { };
         /// <summary>
-        /// How many packets can stand in the send, but unacked state.
+        /// Window size: how far past the first unacknowledged packet the sender may go. Without <see cref="PacketLossBasedCongestionControl"/>
+        /// the whole window is used. Keep it not bigger than the remote side's <see cref="MaxPacketNoFromFuture"/>.
         /// </summary>
         public int MaxUnackedPackets = 1024;
         /// <summary>
         /// How deep into the future packets will be received.
         /// </summary>
         public int MaxPacketNoFromFuture = 1024;
+        /// <summary>
+        /// When the remote side supports batched acknowledgements, one acknowledgement is sent per this many delivered packets.
+        /// </summary>
+        public int AckEveryPackets = 16;
+        /// <summary>
+        /// When the remote side supports batched acknowledgements, a received packet is acknowledged not later than this (plus the timer resolution).
+        /// </summary>
+        public int AckDelayMilliseconds = 2;
+        /// <summary>
+        /// A packet is considered lost and retransmitted right away (without waiting for the timeout), once the remote side
+        /// reports this many packets after it as received. Smaller values react faster, bigger ones tolerate more reordering.
+        /// </summary>
+        public int FastRetransmitAfterPackets = 3;
         /// <summary>
         /// Delay in Ticks (each tick is 100 ns) between Universal Packet Sends.
         /// </summary>
@@ -98,6 +131,13 @@ namespace ModemAPI
                 return ReorderingBuffer.ContainsKey(MissingPacket);
             }
         }
+        private int CurrentWindow
+        {
+            get
+            {
+                return PacketLossBasedCongestionControl ? Math.Max(1, (int)(MaxUnackedPackets * ThrottlingPower)) : MaxUnackedPackets;
+            }
+        }
 
         public SRTPClient(IModem modem, Address dst, string qt, uint cid, int tickTimeout, bool autoclear = true)
         {
@@ -120,7 +160,7 @@ namespace ModemAPI
                             if (info.CheckTimeout(TicksTimeout))
                             {
                                 // retransmit packets
-                                UnivSend(info.Data);
+                                UnivSend(info.Data, BatchedAckDataTag);
                                 // update timeout
                                 info.UpdateTimeStamp();
                                 // check the counter
@@ -152,7 +192,7 @@ namespace ModemAPI
                     }
                 }
             });
-            // reorder task
+            // reorder task, also sends delayed batched acknowledgements
             _ = Task.Run(async delegate ()
             {
                 while (!IsClosed)
@@ -160,13 +200,14 @@ namespace ModemAPI
                     try
                     {
                         ForceReadAllAvailablePackets();
+                        SendDelayedAcknowledgement();
                     }
                     catch (Exception e)
                     {
                         OnError(-1, "Exception: " + e.ToString());
                     }
-                    // wake up on a new packet instead of polling, the timeout is just a safety net
-                    await ReorderSignal.WaitAsync(100);
+                    // wake up on a new packet instead of polling, the timeout is just a safety net or the acknowledgement delay
+                    await ReorderSignal.WaitAsync(Volatile.Read(ref UnacknowledgedPackets) > 0 ? AckDelayMilliseconds : 100);
                 }
             });
             // autoclear task
@@ -196,6 +237,11 @@ namespace ModemAPI
             try
             {
                 byte[] dataReceived = packet.DataBytes;
+                if (packet.Metadata == BatchedAckTag)
+                {
+                    HandleBatchedAcknowledgement(dataReceived);
+                    return;
+                }
                 // parse received packet
                 if (dataReceived.Length < 8)
                 {
@@ -210,27 +256,67 @@ namespace ModemAPI
                     if (InternalState.TryRemove(id, out _))
                     {
                         OnAckReceived(id);
-                        if (PacketLossBasedCongestionControl)
+                        lock (AcknowledgementLock)
                         {
-                            ThrottlingPower = Math.Clamp(ThrottlingPower + 0.1 / MaxUnackedPackets, 0.0001, 1);
+                            AdvanceLowestUnacknowledged();
+                        }
+                        AcknowledgementsReceived(1);
+                    }
+                    return;
+                }
+                // == enqueue packets ==
+                bool batched = packet.Metadata == BatchedAckDataTag;
+                bool tooDeep = false;
+                bool acknowledgeNow = !batched; // older peers expect an acknowledgement for every packet
+                lock (ReceiveLock)
+                {
+                    if (batched)
+                    {
+                        PeerUsesBatchedAcks = true;
+                    }
+                    if (id <= HighestContiguousReceived || ReorderingBuffer.ContainsKey(id))
+                    {
+                        // a retransmission: our acknowledgement got lost or late, so repeat it now
+                        acknowledgeNow = true;
+                    }
+                    else if (LastReceived + MaxPacketNoFromFuture < id)
+                    {
+                        tooDeep = true;
+                    }
+                    else
+                    {
+                        bool inOrder = id == HighestContiguousReceived + 1;
+                        ReorderingBuffer.TryAdd(id, dataReceived);
+                        while (ReorderingBuffer.ContainsKey(HighestContiguousReceived + 1))
+                        {
+                            HighestContiguousReceived++;
+                        }
+                        if (batched && !inOrder)
+                        {
+                            // in-order packets get acknowledged once they are delivered, but a gap means a loss: the sender
+                            // retransmits a hole once FastRetransmitAfterPackets packets after it are reported, so report them
+                            // as soon as there are enough, and then every few packets until the hole is filled
+                            OutOfOrderSinceAcknowledgement++;
+                            acknowledgeNow = OutOfOrderSinceAcknowledgement % (FastRetransmitAfterPackets + 1) == FastRetransmitAfterPackets;
                         }
                     }
                 }
-                if (dataReceived.Length > 8)
+                if (tooDeep)
                 {
-                    // == enqueue packets ==
-                    if (ReceivedNumbers.Contains(id))
-                    {
-                        UnivSend(dataReceived.AsSpan(0, 8).ToArray());
-                        return;
-                    }
-                    if (LastReceived + MaxPacketNoFromFuture < id)
-                    {
-                        OnError(-996, $"Packet {id} is too deep into the future.");
-                        return;
-                    }
-                    ReorderingBuffer.TryAdd(id, dataReceived);
-                    WakeUpReorderTask();
+                    OnError(-996, $"Packet {id} is too deep into the future.");
+                    return;
+                }
+                WakeUpReorderTask();
+                if (!acknowledgeNow)
+                {
+                    return;
+                }
+                if (batched)
+                {
+                    SendBatchedAcknowledgement();
+                }
+                else
+                {
                     UnivSend(dataReceived.AsSpan(0, 8).ToArray());
                     ModemAPIDebugger.OutputDebugMessage($"UnivSend acknowledgement for packet {id}");
                 }
@@ -238,6 +324,176 @@ namespace ModemAPI
             catch (Exception e)
             {
                 OnError(-1, "Exception: " + e.ToString());
+            }
+        }
+        private void HandleBatchedAcknowledgement(byte[] acknowledgement)
+        {
+            if (acknowledgement.Length < 8)
+            {
+                OnError(16, "Packet too short.");
+                return;
+            }
+            long cumulative = BinaryPrimitives.ReadInt64BigEndian(acknowledgement);
+            int acknowledged = 0;
+            List<ReliablePacketInformation>? lost = null;
+            lock (AcknowledgementLock)
+            {
+                long upTo = Math.Min(cumulative, Interlocked.Read(ref SequentialPacketNumber) - 1);
+                for (long id = LowestUnacknowledged; id <= upTo; id++)
+                {
+                    if (InternalState.TryRemove(id, out _))
+                    {
+                        acknowledged++;
+                        OnAckReceived(id);
+                    }
+                }
+                if (upTo >= LowestUnacknowledged)
+                {
+                    LowestUnacknowledged = upTo + 1;
+                }
+                for (int bit = 0; bit < (acknowledgement.Length - 8) * 8; bit++)
+                {
+                    if ((acknowledgement[8 + bit / 8] & (1 << (bit % 8))) != 0 && InternalState.TryRemove(cumulative + 1 + bit, out _))
+                    {
+                        acknowledged++;
+                        OnAckReceived(cumulative + 1 + bit);
+                    }
+                }
+                // the window start doesn't move past selectively acknowledged packets: they are received, but not delivered
+                // yet, and the receiver only takes packets up to its delivered position + MaxPacketNoFromFuture
+                lost = FindLostPackets(acknowledgement, cumulative);
+            }
+            if (acknowledged > 0)
+            {
+                AcknowledgementsReceived(acknowledged);
+            }
+            if (lost != null)
+            {
+                // fast retransmit: the holes are resent now instead of after TicksTimeout
+                foreach (ReliablePacketInformation info in lost)
+                {
+                    UnivSend(info.Data, BatchedAckDataTag);
+                    info.UpdateTimeStamp();
+                    OnRetransmit(info.Id);
+                }
+                if (PacketLossBasedCongestionControl && LastWindowHalvingTimer.Elapsed.Ticks > TicksTimeout)
+                {
+                    ThrottlingPower = Math.Clamp(ThrottlingPower / 2, 0.0001, 1);
+                    LastWindowHalvingTimer.Restart();
+                }
+            }
+        }
+        /// <summary>
+        /// Finds the holes in a selective acknowledgement: packets not reported as received, while at least
+        /// <see cref="FastRetransmitAfterPackets"/> packets after them are. Must be called under <see cref="AcknowledgementLock"/>.
+        /// </summary>
+        /// <returns>Packets to retransmit right away or null</returns>
+        private List<ReliablePacketInformation>? FindLostPackets(byte[] acknowledgement, long cumulative)
+        {
+            int bits = (acknowledgement.Length - 8) * 8;
+            long highestReported = -1;
+            for (int bit = bits - 1; bit >= 0; bit--)
+            {
+                if ((acknowledgement[8 + bit / 8] & (1 << (bit % 8))) != 0)
+                {
+                    highestReported = cumulative + 1 + bit;
+                    break;
+                }
+            }
+            if (highestReported < 0)
+            {
+                return null;
+            }
+            List<ReliablePacketInformation>? lost = null;
+            long sent = Interlocked.Read(ref SequentialPacketNumber);
+            for (long id = cumulative + 1; id <= highestReported - FastRetransmitAfterPackets; id++)
+            {
+                int bit = (int)(id - cumulative - 1);
+                if ((acknowledgement[8 + bit / 8] & (1 << (bit % 8))) != 0 || !InternalState.TryGetValue(id, out ReliablePacketInformation? info))
+                {
+                    continue;
+                }
+                // a hole is resent once; it is resent again only when packets sent after that retransmission arrive
+                // without it, which means the retransmission got lost too
+                if (info.FastRetransmittedBefore < 0 || highestReported >= info.FastRetransmittedBefore + FastRetransmitAfterPackets)
+                {
+                    info.FastRetransmittedBefore = sent;
+                    (lost ??= []).Add(info);
+                }
+            }
+            return lost;
+        }
+        /// <summary>
+        /// Moves the window start past every acknowledged packet. Must be called under <see cref="AcknowledgementLock"/>.
+        /// </summary>
+        private void AdvanceLowestUnacknowledged()
+        {
+            // Transmit adds a packet before counting it, so every number below SequentialPacketNumber is either waiting or acknowledged
+            while (LowestUnacknowledged < Interlocked.Read(ref SequentialPacketNumber) && !InternalState.ContainsKey(LowestUnacknowledged))
+            {
+                LowestUnacknowledged++;
+            }
+        }
+        private void AcknowledgementsReceived(int count)
+        {
+            if (PacketLossBasedCongestionControl)
+            {
+                ThrottlingPower = Math.Clamp(ThrottlingPower + 0.1 * count / MaxUnackedPackets, 0.0001, 1);
+            }
+            // free slots in the window: wake up Transmit and WaitForAcknowledgements
+            lock (WindowLock)
+            {
+                Monitor.PulseAll(WindowLock);
+            }
+        }
+        private void SendBatchedAcknowledgement()
+        {
+            byte[] acknowledgement;
+            long cumulative;
+            lock (ReceiveLock)
+            {
+                if (!PeerUsesBatchedAcks)
+                {
+                    return;
+                }
+                UnacknowledgedPackets = 0;
+                OutOfOrderSinceAcknowledgement = 0;
+                // only delivered packets are acknowledged as a whole, so the sender can't get further ahead of the
+                // application than the window, and the receiving buffer stays bounded
+                cumulative = LastReceived;
+                Span<byte> bitmap = stackalloc byte[SelectiveAckBits / 8];
+                bitmap.Clear();
+                int bitmapLength = 0;
+                // received, but not delivered yet: reported selectively, so they don't get retransmitted
+                if (!ReorderingBuffer.IsEmpty)
+                {
+                    for (int bit = 0; bit < SelectiveAckBits; bit++)
+                    {
+                        if (ReorderingBuffer.ContainsKey(cumulative + 1 + bit))
+                        {
+                            bitmap[bit / 8] |= (byte)(1 << (bit % 8));
+                            bitmapLength = bit / 8 + 1;
+                        }
+                    }
+                }
+                acknowledgement = new byte[8 + bitmapLength];
+                BinaryPrimitives.WriteInt64BigEndian(acknowledgement, cumulative);
+                bitmap[..bitmapLength].CopyTo(acknowledgement.AsSpan(8));
+            }
+            UnivSend(acknowledgement, BatchedAckTag);
+            OnAckTransmitted(cumulative);
+        }
+        private void SendDelayedAcknowledgement()
+        {
+            bool due;
+            lock (ReceiveLock)
+            {
+                due = UnacknowledgedPackets > 0 &&
+                    Stopwatch.GetElapsedTime(FirstUnacknowledgedTimestamp).TotalMilliseconds >= AckDelayMilliseconds;
+            }
+            if (due)
+            {
+                SendBatchedAcknowledgement();
             }
         }
         private void WakeUpReorderTask()
@@ -259,7 +515,7 @@ namespace ModemAPI
         {
             foreach (long pno in ReorderingBuffer.Keys)
             {
-                if (!ReceivedNumbers.Contains(pno))
+                if (pno > LastReceived)
                 {
                     return false;
                 }
@@ -276,17 +532,12 @@ namespace ModemAPI
         }
         public void ClearReorderingBuffer()
         {
-            List<long> toRemove = [];
             foreach (long pno in ReorderingBuffer.Keys)
             {
-                if (ReceivedNumbers.Contains(pno))
+                if (pno <= LastReceived)
                 {
-                    toRemove.Add(pno);
+                    ReorderingBuffer.TryRemove(pno, out _);
                 }
-            }
-            foreach (long pno in toRemove)
-            {
-                ReorderingBuffer.TryRemove(pno, out _);
             }
         }
         public void Transmit(byte[] data)
@@ -304,48 +555,80 @@ namespace ModemAPI
             {
                 throw new ArgumentOutOfRangeException(nameof(data), "data must contain not more than 59992 bytes and not less than 1 byte");
             }
+            // wait for a free slot in the window, acknowledgements wake this thread up
+            WaitForWindow(delegate () { return SequentialPacketNumber - Volatile.Read(ref LowestUnacknowledged) < CurrentWindow; });
+            byte[] data_ = new byte[data.Length + 8];
+            BinaryPrimitives.WriteInt64BigEndian(data_.AsSpan(), SequentialPacketNumber);
+            data.CopyTo(data_, 8);
+            InternalState.TryAdd(SequentialPacketNumber, new(SequentialPacketNumber, DateTime.Now.Ticks, data_));
+            Interlocked.Increment(ref SequentialPacketNumber);
+            UnivSend(data_, BatchedAckDataTag);
+        }
+        /// <summary>
+        /// Blocks until the remote side acknowledges every transmitted packet. Call it before <see cref="Close"/>, otherwise
+        /// packets lost on the way would never be retransmitted.
+        /// </summary>
+        /// <exception cref="TimeoutException">Not everything was acknowledged in <see cref="TransmitTimeOutInTicks"/></exception>
+        /// <exception cref="InvalidOperationException">The client was closed</exception>
+        /// <exception cref="OperationCanceledException">The remote side is considered dead</exception>
+        public void WaitForAcknowledgements()
+        {
+            WaitForWindow(delegate () { return InternalState.IsEmpty; });
+        }
+        private void WaitForWindow(Func<bool> isReady)
+        {
             long start = Stopwatch.GetTimestamp();
-            while (InternalState.Count > MaxUnackedPackets * ThrottlingPower)
+            while (true)
             {
-                //OnError(-1885, "Pending for acknowledgement packets storage is full");
-                if (Stopwatch.GetElapsedTime(start) > TimeSpan.FromTicks(TransmitTimeOutInTicks))
+                lock (WindowLock)
                 {
-                    throw new TimeoutException("Transmit timed out. Normally this will mean that the remote side is dead and you want to Close() this SRTPClient.");
-                }
-                if (IsClosed)
-                {
-                    throw new InvalidOperationException("This client is in an invalid state \"Closed\". To transmit data, it must be in state \"Opened\"");
+                    if (isReady())
+                    {
+                        return;
+                    }
+                    if (!IsClosed && !FailedDueToTooManyRetxAttepms && Stopwatch.GetElapsedTime(start) <= TimeSpan.FromTicks(TransmitTimeOutInTicks))
+                    {
+                        // the timeout only matters if a wake up got lost or the window size changed
+                        Monitor.Wait(WindowLock, 100);
+                        continue;
+                    }
                 }
                 if (FailedDueToTooManyRetxAttepms)
                 {
                     Close();
                     throw new OperationCanceledException("Client was cancelled by the retransmission thread: too many retransmission attempts.");
                 }
-                Thread.Sleep(100);
+                if (IsClosed)
+                {
+                    throw new InvalidOperationException("This client is in an invalid state \"Closed\". To transmit data, it must be in state \"Opened\"");
+                }
+                throw new TimeoutException("Transmit timed out. Normally this will mean that the remote side is dead and you want to Close() this SRTPClient.");
             }
-            byte[] data_ = new byte[data.Length + 8];
-            BinaryPrimitives.WriteInt64BigEndian(data_.AsSpan(), SequentialPacketNumber);
-            data.CopyTo(data_, 8);
-            InternalState.TryAdd(SequentialPacketNumber, new(SequentialPacketNumber, DateTime.Now.Ticks, data_));
-            Interlocked.Increment(ref SequentialPacketNumber);
-            UnivSend(data_);
         }
         public void Close()
         {
+            if (!IsClosed && Volatile.Read(ref UnacknowledgedPackets) > 0)
+            {
+                // don't leave the sender waiting for a delayed acknowledgement, that will never come
+                SendBatchedAcknowledgement();
+            }
             IsClosed = true;
             Modem.DetachReceiveEventNoUnfragment(OnPacketReceived);
             WakeUpReorderTask();
             ReorderingBuffer.Clear();
-            ReceivedNumbers.Clear();
             InternalState.Clear();
+            lock (WindowLock)
+            {
+                Monitor.PulseAll(WindowLock);
+            }
             OnMessageReceived = delegate { };
             OnClose(this);
         }
         public bool WasPacketReceived(long packno)
         {
-            return ReceivedNumbers.Contains(packno);
+            return packno <= HighestContiguousReceived || ReorderingBuffer.ContainsKey(packno);
         }
-        private void UnivSend(byte[]? data)
+        private void UnivSend(byte[]? data, string? metadata = null)
         {
             try
             {
@@ -359,7 +642,7 @@ namespace ModemAPI
                     OnError(1048576, "This client does not communicate with any remote system.");
                     return;
                 }
-                Modem.LowLevelTransmit(data, CommunicatingWith, QueryType, ConnectionID);
+                Modem.LowLevelTransmit(data, CommunicatingWith, QueryType, ConnectionID, metadata);
             }
             catch (Exception ex)
             {
@@ -398,14 +681,33 @@ namespace ModemAPI
         }
         private void ForceReadAllAvailablePackets()
         {
-            while (ReorderingBuffer.TryRemove(LastReceived + 1, out byte[]? dataFromBuffer))
+            while (true)
             {
-                ReceivedNumbers.Add(LastReceived + 1);
-                ModemAPIDebugger.OutputDebugMessage("added to received numbers");
+                byte[]? dataFromBuffer;
+                bool acknowledge = false;
+                lock (ReceiveLock)
+                {
+                    // removing and counting the packet together keeps it "received" for duplicate checks at every moment
+                    if (!ReorderingBuffer.TryRemove(LastReceived + 1, out dataFromBuffer))
+                    {
+                        return;
+                    }
+                    LastReceived++;
+                    if (PeerUsesBatchedAcks)
+                    {
+                        if (UnacknowledgedPackets++ == 0)
+                        {
+                            FirstUnacknowledgedTimestamp = Stopwatch.GetTimestamp();
+                        }
+                        acknowledge = UnacknowledgedPackets >= AckEveryPackets;
+                    }
+                }
                 OnMessageReceived(this, dataFromBuffer[8..]); // call user events
-                ModemAPIDebugger.OutputDebugMessage("executed user events");
-                Interlocked.Increment(ref LastReceived); // increment LastReceived so everything will work
-                ModemAPIDebugger.OutputDebugMessage("increment: " + LastReceived);
+                if (acknowledge)
+                {
+                    SendBatchedAcknowledgement();
+                }
+                ModemAPIDebugger.OutputDebugMessage("delivered: " + LastReceived);
             }
         }
     }

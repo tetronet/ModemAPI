@@ -12,5 +12,9 @@ namespace ModemAPI
         DataTimedOut = 1,
         FindingHeaders = 2,
         NoHeader = 3,
+        /// <summary>
+        /// More Stable Serial Packet received a line too long to be a packet without a line terminator in it.
+        /// </summary>
+        LineTooLong = 4,
     }
 }

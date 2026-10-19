@@ -12,6 +12,10 @@ namespace ModemAPI
         public long TimeStamp;
         public byte[]? Data;
         public int RetransmissionCounter = 0;
+        /// <summary>
+        /// Sequential number of the next packet at the moment of the last fast retransmission of this one, or -1 if there was none.
+        /// </summary>
+        public long FastRetransmittedBefore = -1;
 
         public ReliablePacketInformation()
         {
