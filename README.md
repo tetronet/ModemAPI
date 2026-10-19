@@ -72,7 +72,7 @@ dotnet add package System.IO.Hashing
 
 ### CIASes
 You can create your own, or use one of mine for testing:
-- `wss://data-set.su:3000/` - is for Socket.IO connections
+- `wss://data-set.su:3000/` - originally was for Socket.IO connections, but now also runs on RAWWS
 - `ws://data-set.su:30000/` - is for Raw websocket connections
 
 ### Project
