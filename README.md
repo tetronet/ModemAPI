@@ -7,7 +7,7 @@ Test code (Tx and Rx):
 // Transmission side
 using ModemAPI;
 
-VirtualModem modem = new VirtualModem("wss://data-set.su:3000", new LineParams()); // create the modem
+VirtualModem modem = new VirtualModem("wss://data-set.su:3000", new LineParams(), rawWs: true); // create the modem
 modem.Dial();
 Console.Write("Connecting");
 while (!modem.IsModemConnected)
@@ -32,7 +32,7 @@ while (true)
 // Receiver code
 using ModemAPI;
 
-VirtualModem modem = new VirtualModem("wss://data-set.su:3000", new LineParams()); // create the modem
+VirtualModem modem = new VirtualModem("wss://data-set.su:3000", new LineParams(), rawWs: true); // create the modem
 modem.Dial();
 Console.Write("Connecting");
 while (!modem.IsModemConnected)
