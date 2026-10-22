@@ -1021,11 +1021,6 @@ namespace ModemAPI
             throw new NotImplementedException();
         }
 
-        public void LowLevelTransmit(byte[] data, Address address, string queryType, uint connectionId, string? metadata = null)
-        {
-            throw new NotImplementedException();
-        }
-
         public void Transmit(byte[] data, Address address, string queryType, uint connectionId, string? metadata = null, ushort packetSize = 1024, int delay = 0, ushort ttl = ushort.MaxValue)
         {
             throw new NotImplementedException();

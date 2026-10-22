@@ -37,7 +37,7 @@ namespace ModemAPI
                 || message.package_info.package_no == null
                 || message.package_info.message_id == null)
             {
-                return Packet.Static.ErroredPacket;
+                return Errored(PacketReadError.WrongFormat);
                 //throw new ArgumentNullException(nameof(message), "websocket message must nothave null in all fields except metadata");
             }
             return new Packet(
@@ -102,52 +102,56 @@ namespace ModemAPI
             {
                 return Packet.Static.ErroredPacket;
             }
-            if (!bytes[..4].SequenceEqual(CIoCILDefaultPhrases.PacketTransferHeader) ||
-                Crc32.HashToUInt32(bytes[..^4]) != BinaryPrimitives.ReadUInt32LittleEndian(bytes[^4..]))
+            if (!bytes[..4].SequenceEqual(CIoCILDefaultPhrases.PacketTransferHeader))
             {
-                return new Packet { IsErrorWhileReading = true };
+                return Errored(PacketReadError.NotAPacket);
             }
+            if (Crc32.HashToUInt32(bytes[..^4]) != BinaryPrimitives.ReadUInt32LittleEndian(bytes[^4..]))
+            {
+                return Errored(PacketReadError.CrcMismatch);
+            }
+            if (bytes.Length < FixedPacketSize)
+            {
+                return Errored(PacketReadError.WrongFormat);
+            }
+            // the CRC-32 can match by chance (or on purpose), so every length is checked against what is really there:
+            // a broken packet becomes an errored one instead of an exception in the reader thread of a modem
+            ReadOnlySpan<byte> body = bytes[..^4];
             int offset = 4;
             ModemAPIDebugger.OutputDebugMessage("Converting the packet to byte[] at 94 line in PacketConverter.cs");
-            // Get receiver address for packet
-            byte addressReceiverLength = bytes[offset];
-            offset += 1;
-            ReadOnlySpan<byte> addressReceiver = bytes.Slice(offset, addressReceiverLength);
-            offset += addressReceiverLength;
-            // Get transmitter address for packet
-            byte addressTransmitterLength = bytes[offset];
-            offset += 1;
-            ReadOnlySpan<byte> addressTransmitter = bytes.Slice(offset, addressTransmitterLength);
-            offset += addressTransmitterLength;
-            // Get query type for packet
-            byte queryTypeLength = bytes[offset];
-            offset += 1;
-            ReadOnlySpan<byte> queryType = bytes.Slice(offset, queryTypeLength);
-            offset += queryTypeLength;
+            // Get receiver address, transmitter address and query type for packet
+            if (!TryTake(body, ref offset, 1, out ReadOnlySpan<byte> addressReceiver) ||
+                !TryTake(body, ref offset, 1, out ReadOnlySpan<byte> addressTransmitter) ||
+                !TryTake(body, ref offset, 1, out ReadOnlySpan<byte> queryType))
+            {
+                return Errored(PacketReadError.WrongFormat);
+            }
+            // connection ID (4), last in sequence (1), transmission No. (8), message ID (8), TTL (2)
+            if (body.Length - offset < 4 + 1 + 8 + 8 + 2)
+            {
+                return Errored(PacketReadError.WrongFormat);
+            }
             // Get connection ID for packet
-            uint connectid = BinaryPrimitives.ReadUInt32BigEndian(bytes.Slice(offset, 4));
+            uint connectid = BinaryPrimitives.ReadUInt32BigEndian(body.Slice(offset, 4));
             offset += 4;
             // Get is last in packet sequence address for packet
-            byte isLastInPacketSequence = bytes[offset];
+            byte isLastInPacketSequence = body[offset];
             offset += 1;
             // Get packet transmission No.
-            ulong transmissionNo = BinaryPrimitives.ReadUInt64BigEndian(bytes.Slice(offset));
+            ulong transmissionNo = BinaryPrimitives.ReadUInt64BigEndian(body.Slice(offset));
             offset += 8;
             // Get packet message id
-            ulong messageId = BinaryPrimitives.ReadUInt64BigEndian(bytes.Slice(offset));
+            ulong messageId = BinaryPrimitives.ReadUInt64BigEndian(body.Slice(offset));
             offset += 8;
             // Get packet TTL
-            ushort ttl = BinaryPrimitives.ReadUInt16BigEndian(bytes.Slice(offset));
+            ushort ttl = BinaryPrimitives.ReadUInt16BigEndian(body.Slice(offset));
             offset += 2;
-            // Get data for packet
-            ushort packetDataLength = BinaryPrimitives.ReadUInt16BigEndian(bytes.Slice(offset));
-            offset += 2;
-            ReadOnlySpan<byte> packetData = bytes.Slice(offset, packetDataLength);
-            offset += packetDataLength;
-            // Get metadata for packet
-            ushort packetMetadataLength = BinaryPrimitives.ReadUInt16BigEndian(bytes.Slice(offset));
-            offset += 2;
-            ReadOnlySpan<byte> packetMetadata = bytes.Slice(offset, packetMetadataLength);
+            // Get data and metadata for packet
+            if (!TryTake(body, ref offset, 2, out ReadOnlySpan<byte> packetData) ||
+                !TryTake(body, ref offset, 2, out ReadOnlySpan<byte> packetMetadata))
+            {
+                return Errored(PacketReadError.WrongFormat);
+            }
             bool isLastInPacketSequence_;
             if (isLastInPacketSequence == CIoCILDefaultPhrases.CIoCILTrue[0])
             {
@@ -159,13 +163,14 @@ namespace ModemAPI
             }
             else
             {
-                return Packet.Static.ErroredPacket;
+                return Errored(PacketReadError.WrongFormat);
             }
             foreach (byte b in packetMetadata)
             {
                 if (!MetadataByteAllowed[b])
                 {
-                    throw new WrongCharacherException("metadata must follow valid charlist");
+                    // metadata must follow the valid charlist
+                    return Errored(PacketReadError.WrongMetadata);
                 }
             }
             Packet prepare = new(
@@ -173,7 +178,8 @@ namespace ModemAPI
                 new Address(GetAsciiString(addressReceiver, ref LastReceiver)),
                 packetData.ToArray(),
                 isLastInPacketSequence_,
-                Encoding.ASCII.GetString(packetMetadata),
+                // no metadata is null, as Packet.Metadata documents
+                packetMetadata.IsEmpty ? null : Encoding.ASCII.GetString(packetMetadata),
                 GetAsciiString(queryType, ref LastQueryType),
                 connectid,
                 false,
@@ -185,6 +191,30 @@ namespace ModemAPI
             return prepare;
         }
 
+        private static Packet Errored(PacketReadError reason)
+        {
+            return new Packet { IsErrorWhileReading = true, ReadError = reason };
+        }
+        /// <summary>
+        /// Takes a field prefixed with its big-endian length of lengthSize bytes, if both fit into the packet.
+        /// </summary>
+        private static bool TryTake(ReadOnlySpan<byte> body, ref int offset, int lengthSize, out ReadOnlySpan<byte> field)
+        {
+            field = default;
+            if (body.Length - offset < lengthSize)
+            {
+                return false;
+            }
+            int length = lengthSize == 1 ? body[offset] : BinaryPrimitives.ReadUInt16BigEndian(body.Slice(offset));
+            offset += lengthSize;
+            if (body.Length - offset < length)
+            {
+                return false;
+            }
+            field = body.Slice(offset, length);
+            offset += length;
+            return true;
+        }
         /// <summary>
         /// Calculates the exact length of the packet after converting it with <see cref="PacketToBytes(Packet)"/>.
         /// </summary>

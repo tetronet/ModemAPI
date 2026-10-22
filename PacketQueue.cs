@@ -1,27 +1,34 @@
-﻿using System.Text;
+﻿using System.Diagnostics;
+using System.Text;
 
 namespace ModemAPI
 {
     /// <summary>
-    /// Represens a Packet Queue, that is being built using packets, received from the Tetronet.
+    /// Represens a Packet Queue, that is being built using packets, received from the Tetronet. Thread-safe.
     /// </summary>
     public class PacketQueue
     {
         private SortedDictionary<ulong, Packet> Packets = new SortedDictionary<ulong, Packet>();
+        private readonly Lock PacketsLock = new();
+        // PacketNo of the packet marked as the last one, or -1 while it hasn't arrived
+        private long LastPacketNo = -1;
+        private ulong HighestPacketNo = 0;
         /// <summary>
-        /// Timestamp of last time when a new packet was introduced in Ticks.
+        /// <see cref="Stopwatch.GetTimestamp"/> of the last time when a new packet was introduced.
         /// </summary>
         public long Timestamp;
         /// <summary>
-        /// Timeout for this Packet Queue
+        /// Timeout for this Packet Queue in ticks (100 ns): how long it lives without new packets.
         /// </summary>
         public readonly int Timeout;
         /// <summary>
         /// Create a new instance of PacketQueue.
         /// </summary>
+        /// <param name="timeout">How long the queue lives without new packets, in ticks (100 ns)</param>
         public PacketQueue(int timeout)
         {
-            Timestamp = DateTime.Now.Ticks;
+            Timeout = timeout;
+            Timestamp = Stopwatch.GetTimestamp();
         }
         /// <summary>
         /// Introduces a new packet to this instance of Packet Queue.
@@ -29,9 +36,21 @@ namespace ModemAPI
         /// <param name="packet">Packet to introduce.</param>
         public void AddPacket(Packet packet)
         {
-            if (Packets.TryAdd(packet.PacketNo, packet))
+            lock (PacketsLock)
             {
-                Timestamp = DateTime.Now.Ticks;
+                if (!Packets.TryAdd(packet.PacketNo, packet))
+                {
+                    return;
+                }
+                if (packet.PacketNo > HighestPacketNo)
+                {
+                    HighestPacketNo = packet.PacketNo;
+                }
+                if (packet.IsLastInSequence && LastPacketNo < 0)
+                {
+                    LastPacketNo = (long)packet.PacketNo;
+                }
+                Timestamp = Stopwatch.GetTimestamp();
             }
         }
         /// <summary>
@@ -40,51 +59,42 @@ namespace ModemAPI
         /// <returns>true, if this Packet Queue is timed out, otherwise - false.</returns>
         public bool IsTimedOut()
         {
-            return DateTime.Now.Ticks - Timeout > Timestamp;
+            return Stopwatch.GetElapsedTime(Volatile.Read(ref Timestamp)).Ticks > Timeout;
         }
         /// <summary>
-        /// Assembles all Packets into a single DataBlock object.
+        /// Assembles all Packets into a single DataBlock object. Cheap while the queue isn't complete, so it can be called for every packet.
         /// </summary>
         /// <returns>DataBlock object, if this Packet Queue is full and is terminated, otherwise - null.</returns>
         public DataBlock? Assemble()
         {
-            bool canAssemble1 = true;
-            bool canAssemble2 = false;
-            for (int i = 0; i < Packets.Count; i++)
+            lock (PacketsLock)
             {
-                if (!Packets.ContainsKey((ulong)i))
+                // complete: the last packet arrived, and so did every packet before it (numbers are unique, so count and
+                // the highest number tell that without walking the queue)
+                if (LastPacketNo < 0 || HighestPacketNo != (ulong)LastPacketNo || Packets.Count != LastPacketNo + 1)
                 {
-                    canAssemble1 = false;
-                    break;
+                    return null;
                 }
-            }
-            foreach (Packet packet in Packets.Values)
-            {
-                canAssemble2 = packet.IsLastInSequence;
-                if (canAssemble2 == true)
-                {
-                    break;
-                }
-            }
-            if (canAssemble1 && canAssemble2)
-            {
                 DataBlock prepare = new();
-                StringBuilder sb = new StringBuilder();
-                Packet lastPacket = Packets.Last().Value;
+                Packet lastPacket = Packets[(ulong)LastPacketNo];
                 prepare.Transmitter = lastPacket.Transmitter;
                 prepare.Receiver = lastPacket.Receiver;
                 prepare.QueryType = lastPacket.QueryType;
                 prepare.Metadata = lastPacket.Metadata;
                 prepare.ConnectionID = lastPacket.ConnectionID;
-                for (int i = 0; i < Packets.Count; i++)
+                int length = 0;
+                foreach (Packet currentPacket in Packets.Values)
                 {
-                    Packet currentPacket = Packets[(ulong)i];
-                    sb.Append(Encoding.UTF8.GetString([.. currentPacket.DataBytes]));
+                    length += currentPacket.DataBytes.Length;
+                }
+                prepare.DataBytes.Capacity = length;
+                foreach (Packet currentPacket in Packets.Values)
+                {
                     prepare.DataBytes.AddRange(currentPacket.DataBytes);
                 }
+                prepare.DataString = Encoding.UTF8.GetString(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(prepare.DataBytes));
                 return prepare;
             }
-            return null;
         }
     }
 }

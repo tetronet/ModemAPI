@@ -12,5 +12,6 @@ namespace ModemAPI
         MoreStableSerialPacket = 1,
         HardwareSerialPort = 2,
         Base64Converter = 3,
+        LowLatencyAnsweringPhysicalModem = 4,
     }
 }

@@ -65,6 +65,7 @@ Low Latency - Copybook Internet over Copybook Internet Lines - mini. How it work
                                  +----------------+
 * Metadata can contain only the symbols from PrintableCharacters string in the PrintableCharacterList.cs file
 * The CRC-32 of the packet is the only little endian field: it's stored the way System.IO.Hashing.Crc32.Hash() writes it
+* Over a TCP line (without More Stable Serial Packet) every packet is prefixed with 3 bytes of its length; over UDP every datagram is exactly one packet, without a length (up to 65507 bytes, a datagram may be fragmented by IP)
 ```
 ##### Large Messages
 ```
@@ -173,6 +174,7 @@ Downloads a resource (a file or any other data) straight from the server, which 
 | (8 bytes signed - the most bytes the client agrees to download)     |
 | (1 byte request type: 0x15 - OBTAIN, 0x2f - HASH)                   |
 | (1 byte supported hash algorithms*, v2 only)                        |
+| (4 bytes request ID, v2 only)                                       |
 +---------------------------------------------------------------------+
                                    |
                                    V
@@ -187,7 +189,8 @@ SRTP session from the server to the client with the same ConnectionID
 | OBTAIN: next messages contain the resource data, until the length   |
 | HASH: one message with the 64 bytes SHA-512 of the resource         |
 +---------------------------------------------------------------------+
-* The ConnectionID of the request must be in the range of the server, and the server answers only once per client address and ConnectionID at a time
+* The ConnectionID of the request must be in the range of the server. A v2 server has one session per client address and ConnectionID: a new request from them ends the session in progress (the client gave it up or is already done with it) and gets a new one
+* A v2 client picks a new random request ID (not 0) for every request. A v2 server remembers the last request IDs of every client address and ConnectionID, and ignores a request with an ID it has seen: that's a duplicate or a late copy, and answering it again would restart or replace the answer in progress. Requests without an ID (v1 clients) are always taken
 * The request is sent once, without retransmission: if it gets lost, the client times out (5 seconds by default)
 * OBTAIN: the hash is the hash of the resource data, the client checks it after receiving the last byte
 * HASH: the hash in the header is SHA-512 of the 64 bytes in the next message, and the length is 64
@@ -206,9 +209,21 @@ Supported hash algorithms:
 ```
 ##### Compatibility
 ```
-* A v1 server reads the request at fixed offsets and doesn't look at the bytes after the request type, so a v2 request works with it, and it answers with SHA-512
+* A v1 server reads the request at fixed offsets and doesn't look at the bytes after the request type, so a v2 request works with it (the hash algorithms and the request ID are ignored), and it answers with SHA-512
 * A v1 client doesn't send the supported hash algorithms, a v2 server treats it as 0x01 (SHA-512 only)
 * 0x0100 is only set when the client asked for XxHash3, so a v1 client never gets it
+```
+##### Limits and guarantees
+```
+* Resource name: 0-65535 bytes of UTF-8; a v2 server ignores requests, that are shorter than their fields or whose name isn't valid UTF-8
+* Resource length: 0 to the maximum the client agreed to download; an empty resource is the header alone
+* Data messages: 1-59992 bytes, the most one SRTP message can carry
+* The client writes the data in order into any writable stream, it doesn't need seeking
+* The hash detects data damaged or lost on the way. It is not authentication: it comes in the same unauthenticated SRTP session
+  as the data, so whoever can change the data on the way can change the hash too, and that is true for SHA-512 as well
+* A v2 client ends the request with an error right away on an error flag, a header breaking the format, a negative length,
+  a length over its maximum, more data than announced or a hash mismatch; it only times out, when nothing arrives
+* A v2 server ends the session whatever happens to the request, so the same client address and ConnectionID can make a new request
 ```
 ##### Terms
 ```

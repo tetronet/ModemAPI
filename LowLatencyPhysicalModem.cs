@@ -19,16 +19,16 @@ namespace ModemAPI
         private long PingInterval;
         private List<Action> CRCMismatchEvents = [];
         private PacketQueueAssembler Assembler = new(1000000, 600000000); // 1 million packet queues at the same time, 60 seconds timeout
-        private bool CurrentlyWritingPacket = false;
         private readonly Lock WriterLock = new();
         private readonly Channel<Packet> TransmissionQueue =
             Channel.CreateBounded<Packet>(new BoundedChannelOptions(1024)
             {
-                FullMode = BoundedChannelFullMode.DropOldest,
+                FullMode = BoundedChannelFullMode.Wait,
                 SingleReader = true,
                 SingleWriter = false
             });
         private volatile bool TxLoopWorking = false;
+        private long LocallyDroppedPackets = 0;
         private readonly SubscriberList<Packet> PacketSubscribers = new();
         private readonly SubscriberList<DataBlock> DataBlockSubscribers = new();
         private readonly Lock PacketDispatcherLock = new();
@@ -59,23 +59,26 @@ namespace ModemAPI
         public ulong LargeMessageMTU { get; private set; }
         public bool CanExchangeLargeMessages { get; private set; }
         /// <summary>
-        /// Counts locally dropped packets.
+        /// Counts packets dropped because the transmission queue was full and <see cref="DropPacketsWhenOverloaded"/> allowed it.
         /// </summary>
-        public long LocallyDroppedPacketsCounter { get; private set; }
+        public long LocallyDroppedPacketsCounter { get { return Interlocked.Read(ref LocallyDroppedPackets); } }
         /// <summary>
         /// True if this <see cref="LowLatencyPhysicalModem"/> is connected, and false if not.
         /// </summary>
         public bool IsModemConnected { get; set; }
         /// <summary>
-        /// Allow this modem to drop packets once the serial port is overloaded.
+        /// Allow this modem to drop packets once the line is overloaded (the transmission queue holds 1024 packets): a dropped packet
+        /// is counted in <see cref="LocallyDroppedPacketsCounter"/>. True by default: SRTP retransmits what got lost, and LMDTP and NLMNP
+        /// time out or repeat. When false, transmitting waits for space instead; then nothing may transmit from a receive event of this
+        /// modem (SRTP acknowledgements, LMDTP and NLMNP do), because the waiting reader thread can deadlock two busy modems.
         /// </summary>
-        public bool DropPacketsWhenOverloaded { get; set; }
+        public bool DropPacketsWhenOverloaded { get; set; } = true;
         /// <summary>
         /// Gets invoked if any data gets dropped by the underlying Level One client, and argument will contain exact count of dropped bytes
         /// </summary>
         public event Action<L1DropBytesReasons, int> L1DroppedData = delegate { };
         /// <summary>
-        /// Gets invoked if some shit happens in the modem.
+        /// Gets invoked when an error happens in the modem.
         /// </summary>
         public event Action<Exception, ErrorEmitter> InternalErrorHappened = delegate { };
 
@@ -91,6 +94,7 @@ namespace ModemAPI
             private L1Types t;
             private List<byte> L1RxBuffer = [];
             private object _writeLock = new();
+            public Action<Exception> ErrorReported = delegate { };
 
             private void TcpReader()
             {
@@ -99,7 +103,8 @@ namespace ModemAPI
                 {
                     if (tcp == null)
                     {
-                        throw new NullTransmitterException("tcp");
+                        ErrorReported(new NullTransmitterException("tcp"));
+                        return;
                     }
                     if (!tcp.Connected)
                     {
@@ -112,56 +117,61 @@ namespace ModemAPI
                         int read = tcp.GetStream().Read(buffer, 0, buffer.Length);
                         if (read == 0)
                         {
-                            // remote side closed the connection, Read would return 0 immediately again
-                            ModemAPIDebugger.OutputDebugMessage($"low latency physical modem was not able to read data from tcp");
-                            Thread.Sleep(50);
-                            continue;
+                            // the remote side closed the connection; this modem doesn't reconnect, so the reader is done
+                            ErrorReported(new EndOfStreamException("the remote side closed the TCP connection"));
+                            return;
                         }
                         ModemAPIDebugger.OutputDebugMessage($"low latency physical modem received data from tcp");
                         L1RxBuffer.AddRange(buffer.AsSpan(0, read));
                         // one read may carry several frames, all of them must be handled before blocking again
-                        while (L1RxBuffer.Count >= 3)
-                        {
-                            int length =
-                                L1RxBuffer[0] << 16 |
-                                L1RxBuffer[1] << 8 |
-                                L1RxBuffer[2];
-                            if (L1RxBuffer.Count < length + 3)
-                            {
-                                break;
-                            }
-                            byte[] data = L1RxBuffer.GetRange(3, length).ToArray();
-                            L1RxBuffer.RemoveRange(0, length + 3);
-                            CallAllEvents(data, delegate () { throw new NotImplementedException(); });
-                        }
+                        L1Framing.ExtractFrames(L1RxBuffer, data => CallAllEvents(data, delegate () { throw new NotImplementedException(); }), ErrorReported);
                     }
-                    catch
+                    catch (ObjectDisposedException)
                     {
-                        ModemAPIDebugger.OutputDebugMessage("error during tcp read");
+                        return;
+                    }
+                    catch (Exception e)
+                    {
+                        ErrorReported(e);
                         Thread.Sleep(50);
                     }
                 }
             }
             private void UdpReader()
             {
+                if (udp == null)
+                {
+                    ErrorReported(new NullTransmitterException("udp"));
+                    return;
+                }
                 while (true)
                 {
-                    if (udp == null)
+                    byte[] datagram;
+                    try
                     {
-                        throw new NullTransmitterException("udp");
+                        IPEndPoint? ep = null;
+                        // one datagram is one whole packet: a lost, repeated or reordered datagram affects only itself
+                        datagram = udp.Receive(ref ep);
+                        ModemAPIDebugger.OutputDebugMessage($"low latency physical modem received a datagram from {ep}");
                     }
-                    IPEndPoint? ep = null;
-                    L1RxBuffer.AddRange(udp.Receive(ref ep));
-                    ModemAPIDebugger.OutputDebugMessage($"low latency physical modem received a datagram from {ep}");
-                    int length = 
-                        L1RxBuffer[0] << 16 &
-                        L1RxBuffer[1] << 8 &
-                        L1RxBuffer[2];
-                    if (L1RxBuffer.Count > length + 3)
+                    catch (ObjectDisposedException)
                     {
-                        byte[] data = [.. L1RxBuffer.Skip(3).Take(length)];
-                        L1RxBuffer.RemoveRange(0, length + 3);
-                        CallAllEvents(data, delegate () { throw new NotImplementedException(); });
+                        // the socket was closed, there is nothing to read anymore
+                        return;
+                    }
+                    catch (Exception e)
+                    {
+                        // for example ICMP "port unreachable" of an earlier datagram; the socket still works
+                        ErrorReported(e);
+                        continue;
+                    }
+                    try
+                    {
+                        CallAllEvents(datagram, delegate () { throw new NotImplementedException(); });
+                    }
+                    catch (Exception e)
+                    {
+                        ErrorReported(e);
                     }
                 }
             }
@@ -181,6 +191,7 @@ namespace ModemAPI
                     throw new InvalidOperationException("already initialized");
                 }
                 this.t = t;
+                isInitialized = true;
             }
 
             /// <summary>
@@ -201,49 +212,24 @@ namespace ModemAPI
                     }
                     if (t == L1Types.L1_INET_TCP)
                     {
-                        if (data.Length > 16777215)
-                        {
-                            throw new ArgumentOutOfRangeException(nameof(data), "buffer bigger than 16777215 bytes");
-                        }
                         if (tcp == null)
                         {
                             throw new NullTransmitterException("tcp");
                         }
-                        // convert length of the buffer to bytes
-                        byte hi = (byte)((data.Length & 0xFF0000) >> 16);
-                        byte mid = (byte)((data.Length & 0x00FF00) >> 8);
-                        byte lo = (byte)(data.Length & 0x0000FF);
-                        // send these bytes
-                        tcp.GetStream().Write([hi, mid, lo]);
-                        tcp.GetStream().Write(data, 0, data.Length);
+                        tcp.GetStream().Write(L1Framing.Frame(data));
                     }
                     if (t == L1Types.L1_INET_UDP)
                     {
-                        if (data.Length > 16777215)
-                        {
-                            throw new ArgumentOutOfRangeException(nameof(data), "buffer bigger than 16777215 bytes");
-                        }
                         if (udp == null)
                         {
                             throw new NullTransmitterException("udp");
                         }
-                        // convert length of the buffer to bytes
-                        byte hi = (byte)((data.Length & 0xFF0000) >> 16);
-                        byte mid = (byte)((data.Length & 0x00FF00) >> 8);
-                        byte lo = (byte)(data.Length & 0x0000FF);
-                        // create buffer for sending to the UDP
-                        byte[] bytes = new byte[3 + data.Length];
-                        // write length of this buffer
-                        bytes[0] = hi;
-                        bytes[1] = mid;
-                        bytes[2] = lo;
-                        // copy data to bytes
-                        data.CopyTo(bytes, 3);
-                        // send buffer as multiple datagrams
-                        for (int i = 0; i < bytes.Length; i += 1024)
+                        if (data.Length > L1Framing.MaxDatagramLength)
                         {
-                            udp.Send(bytes.Skip(i).Take(1024).ToArray());
+                            throw new ArgumentOutOfRangeException(nameof(data), $"a packet sent over UDP must not be longer than {L1Framing.MaxDatagramLength} bytes");
                         }
+                        // the whole packet is one datagram, without a length header: UDP keeps datagrams whole, and losing one loses only that packet
+                        udp.Send(data);
                     }
                 }
             }
@@ -319,18 +305,19 @@ namespace ModemAPI
                 TcpClient client = new();
                 client.Connect(IPAddress.Parse(wire.Split(':')[0]), int.Parse(wire.Split(':')[1]));
                 Communicator = new(client, null, null);
+                UsesRawTcp = true;
             }
             else if (wt == L1Types.L1_INET_UDP)
             {
                 UdpClient client = new();
                 client.Connect(IPAddress.Parse(wire.Split(':')[0]), int.Parse(wire.Split(':')[1]));
-                client.DontFragment = true;
                 Communicator = new(null, client, null);
             }
             else
             {
                 throw new NotSupportedException("L1 type not supported");
             }
+            InitCommunicator(wt == L1Types.L1_INET_TCP && !UsesRawTcp ? L1Types.L1_SERIAL : wt);
         }
         /// <summary>
         /// Initializes a LowLatencyPhysicalModem instance.
@@ -393,19 +380,31 @@ namespace ModemAPI
             {
                 UdpClient client = new();
                 client.Connect(IPAddress.Parse(wire.Split(':')[0]), int.Parse(wire.Split(':')[1]));
-                client.DontFragment = true;
                 Communicator = new(null, client, null);
             }
             else
             {
                 throw new NotSupportedException("L1 type not supported");
             }
+            InitCommunicator(wt == L1Types.L1_INET_TCP && !UsesRawTcp ? L1Types.L1_SERIAL : wt);
         }
 
+        private bool UsesRawTcp = false;
+        private void InitCommunicator(L1Types wireType)
+        {
+            Communicator.Init(wireType);
+            Communicator.ErrorReported = delegate (Exception e)
+            {
+                if (e is EndOfStreamException)
+                {
+                    // the remote side closed the connection, and this modem doesn't reconnect
+                    IsModemConnected = false;
+                }
+                InternalErrorHappened(e, ErrorEmitter.LowLatencyPhysicalModem);
+            };
+        }
         public void Dial()
         {
-            // init
-            Communicator.Init(L1Types.L1_SERIAL);
             // attach response handler
             Communicator.OnDataRead(delegate (byte[] d, Action k)
             {
@@ -570,63 +569,48 @@ namespace ModemAPI
 
         internal void Transmit(Packet packet)
         {
+            // the queue is bounded: when the line can't keep up, either the caller waits for space (the default), or the packet
+            // is dropped and counted, if DropPacketsWhenOverloaded allows that
+            if (!TransmissionQueue.Writer.TryWrite(packet))
+            {
+                if (DropPacketsWhenOverloaded)
+                {
+                    Interlocked.Increment(ref LocallyDroppedPackets);
+                    return;
+                }
+                TransmissionQueue.Writer.WriteAsync(packet).AsTask().GetAwaiter().GetResult();
+            }
+            if (TxLoopWorking)
+            {
+                return;
+            }
             lock (WriterLock)
             {
-                TransmissionQueue.Writer.TryWrite(packet);
-                if (!TxLoopWorking)
+                if (TxLoopWorking)
                 {
-                    TxLoopWorking = true;
-                    try
+                    return;
+                }
+                TxLoopWorking = true;
+                // one sender thread for the whole life of the modem (writing to the line blocks, so it gets a thread of its own
+                // instead of a thread pool one): a write error is reported and the next packet is sent anyway
+                new Thread(delegate ()
+                {
+                    while (TransmissionQueue.Reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult())
                     {
-                        Task.Run(async delegate ()
+                        while (TransmissionQueue.Reader.TryRead(out Packet? thePacket))
                         {
                             try
                             {
-                                while (true)
-                                {
-                                    try
-                                    {
-                                        if (!await TransmissionQueue.Reader.WaitToReadAsync())
-                                        {
-                                            lock (WriterLock)
-                                            {
-                                                TxLoopWorking = false;
-                                            }
-                                            break;
-                                        }
-                                        if (TransmissionQueue.Reader.TryRead(out Packet? thePacket))
-                                        {
-                                            Communicator.Write(PacketConverter.PacketToBytes(thePacket));
-                                        }
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        InternalErrorHappened(ex, ErrorEmitter.LowLatencyPhysicalModem);
-                                        lock (WriterLock)
-                                        {
-                                            TxLoopWorking = false;
-                                        }
-                                        break;
-                                    }
-                                }
+                                Communicator.Write(PacketConverter.PacketToBytes(thePacket));
                             }
-                            finally
+                            catch (Exception ex)
                             {
-                                lock (WriterLock)
-                                {
-                                    TxLoopWorking = false;
-                                }
+                                InternalErrorHappened(ex, ErrorEmitter.LowLatencyPhysicalModem);
                             }
-                        });
-                    }
-                    catch
-                    {
-                        lock (WriterLock)
-                        {
-                            TxLoopWorking = false;
                         }
                     }
-                }
+                })
+                { IsBackground = true, Name = "LowLatencyPhysicalModem sender" }.Start();
             }
         }
 
@@ -657,9 +641,9 @@ namespace ModemAPI
                 return;
             }
             Assembler.AddPacket(p);
-            DataBlock? possibleAssembledPacketQueue = Assembler.GetPacketQueue(p.MessageId)?.Assemble();
+            DataBlock? possibleAssembledPacketQueue = Assembler.GetPacketQueue(p.Transmitter, p.MessageId)?.Assemble();
             // only the call that removed the queue delivers it, so a data block is never delivered twice
-            if (possibleAssembledPacketQueue != null && Assembler.RemovePacketQueue(p.MessageId))
+            if (possibleAssembledPacketQueue != null && Assembler.RemovePacketQueue(p.Transmitter, p.MessageId))
             {
                 DataBlockSubscribers.Invoke(possibleAssembledPacketQueue, k);
             }
@@ -694,7 +678,15 @@ namespace ModemAPI
             if (p.IsErrorWhileReading)
             {
                 ModemAPIDebugger.OutputDebugMessage("low latency modem received a corrupted packet");
-                CallAllEventsOfCrc();
+                if (p.ReadError == PacketReadError.CrcMismatch)
+                {
+                    CallAllEventsOfCrc();
+                }
+                else
+                {
+                    // a packet with a correct CRC, but a wrong structure: not damage on the line, so it isn't reported as a CRC mismatch
+                    InternalErrorHappened(new InvalidDataException($"received a packet, that can't be read: {p.ReadError}"), ErrorEmitter.LowLatencyPhysicalModem);
+                }
                 return;
             }
             PacketSubscribers.Invoke(p, k);

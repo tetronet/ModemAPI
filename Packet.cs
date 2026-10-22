@@ -68,6 +68,10 @@
         /// </summary>
         public bool IsErrorWhileReading = false;
         /// <summary>
+        /// Why the packet couldn't be read, when <see cref="IsErrorWhileReading"/> is true.
+        /// </summary>
+        public PacketReadError ReadError = PacketReadError.None;
+        /// <summary>
         /// Packet transmission No. to get when packet order gets messed up.
         /// </summary>
         public ulong PacketNo = 0;
@@ -88,7 +92,7 @@
             /// <summary>
             /// Represents a packet, that had one or more errors to occur during receiving process.
             /// </summary>
-            public static readonly Packet ErroredPacket = new(new(), new(), [], false, null, "", 0, true, 0, 0, 0);
+            public static readonly Packet ErroredPacket = new(new(), new(), [], false, null, "", 0, true, 0, 0, 0) { ReadError = PacketReadError.NotAPacket };
         }
     }
 }

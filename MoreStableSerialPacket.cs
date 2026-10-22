@@ -15,6 +15,10 @@ namespace ModemAPI
         /// A line longer than this can't be a packet (base64 of the biggest one is ~90 KB), so it gets dropped instead of growing the buffer forever.
         /// </summary>
         private const int MaxLineLength = 16 * 1024 * 1024;
+        /// <summary>
+        /// The reader gives up after this many failed reads in a row: the stream is broken for good, not just having a bad moment.
+        /// </summary>
+        private const int MaxFailedReadsInARow = 100;
         private Stream io;
         private readonly Lock _writeLock = new();
         private Action<byte[], Action> OnReceive = delegate { };
@@ -27,7 +31,11 @@ namespace ModemAPI
         public MoreStableSerialPacket(Stream io)
         {
             this.io = io;
-            io.ReadTimeout = Timeout.Infinite;
+            // streams without timeouts (memory, files, pipes) throw on setting one
+            if (io.CanTimeout)
+            {
+                io.ReadTimeout = Timeout.Infinite;
+            }
             Task.Factory.StartNew(ReaderLoop, TaskCreationOptions.LongRunning);
         }
 
@@ -65,6 +73,8 @@ namespace ModemAPI
             int end = 0;
             bool firstRead = true;
             bool skipLineFeed = false; // the last line ended with '\r', so a '\n' right after it belongs to the same terminator
+            bool skipRestOfLine = false; // a too long line was dropped, and the rest of it must not be read as a line of its own
+            int failedReads = 0;
             while (true)
             {
                 if (end == buffer.Length)
@@ -80,6 +90,7 @@ namespace ModemAPI
                     {
                         OnDataDropped(L1DropBytesReasons.LineTooLong, end);
                         end = 0;
+                        skipRestOfLine = true;
                     }
                     else
                     {
@@ -90,15 +101,29 @@ namespace ModemAPI
                 try
                 {
                     read = io.Read(buffer, end, buffer.Length - end);
+                    failedReads = 0;
                 }
                 catch (TimeoutException te)
                 {
                     InternalErrorHappened(te, ErrorEmitter.HardwareSerialPort);
                     continue;
                 }
+                catch (Exception e) when (e is ObjectDisposedException or NotSupportedException)
+                {
+                    // the stream was closed or can't be read: nothing will ever come from it
+                    InternalErrorHappened(e, ErrorEmitter.MoreStableSerialPacket);
+                    TextReaderReturnedNull();
+                    break;
+                }
                 catch (Exception e)
                 {
                     InternalErrorHappened(e, ErrorEmitter.MoreStableSerialPacket);
+                    if (++failedReads >= MaxFailedReadsInARow)
+                    {
+                        // still failing after a second: the stream is broken for good, the reader stops
+                        TextReaderReturnedNull();
+                        break;
+                    }
                     // a broken stream keeps throwing, so don't spin on it
                     Thread.Sleep(10);
                     continue;
@@ -106,7 +131,7 @@ namespace ModemAPI
                 if (read == 0)
                 {
                     // end of the stream: like StreamReader.ReadLine, an unterminated last line is still a line
-                    if (end > start)
+                    if (end > start && !skipRestOfLine)
                     {
                         ProcessLine(buffer.AsSpan(start, end - start));
                     }
@@ -139,9 +164,23 @@ namespace ModemAPI
                     int lineEnd = pending.IndexOfAny((byte)'\n', (byte)'\r');
                     if (lineEnd < 0)
                     {
+                        if (skipRestOfLine)
+                        {
+                            // still inside the dropped line, nothing here is worth keeping
+                            start = end;
+                        }
                         break;
                     }
-                    ProcessLine(pending[..lineEnd]);
+                    if (skipRestOfLine)
+                    {
+                        // the end of the dropped line
+                        OnDataDropped(L1DropBytesReasons.LineTooLong, lineEnd);
+                        skipRestOfLine = false;
+                    }
+                    else
+                    {
+                        ProcessLine(pending[..lineEnd]);
+                    }
                     skipLineFeed = pending[lineEnd] == (byte)'\r';
                     start += lineEnd + 1;
                 }

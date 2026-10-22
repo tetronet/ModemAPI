@@ -32,7 +32,7 @@ namespace ModemAPI
         [Conditional("MODEM_API_DEBUG")]
         public static void PrintAddressPortPairDict(Dictionary<Address, string> keyValuePairs)
         {
-            for (int i = 0; i > keyValuePairs.Count; i++)
+            for (int i = 0; i < keyValuePairs.Count; i++)
             {
                 Console.Write("Address \\ Port: ");
                 Console.Write(keyValuePairs.Keys.ToArray()[i].AddressValue);

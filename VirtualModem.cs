@@ -3,10 +3,8 @@ using System.Buffers;
 using System.IO.Hashing;
 using System.IO.Ports;
 using System.Net.WebSockets;
-using System.Reflection;
 using System.Text;
 using System.Text.Json;
-using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace ModemAPI
 {
@@ -20,8 +18,6 @@ namespace ModemAPI
         private ClientWebSocket? RawTransmitterDevice = null;
         private object PacketBufferLock = new object();
         private SortedDictionary<ulong, SortedDictionary<ulong, Packet>> PacketBuffer = new SortedDictionary<ulong, SortedDictionary<ulong, Packet>>();
-        private byte[]? MessageBufferBytes = null;
-        private int MessageBufferBytesCursor = 0;
         private event Action<Packet, Action> InternalPacketEvents = delegate { };
         private readonly SubscriberList<Packet> PacketSubscribers = new();
         private readonly SubscriberList<DataBlock> DataBlockSubscribers = new();
@@ -32,7 +28,6 @@ namespace ModemAPI
         private Dictionary<string, string> AddressPortPairs = []; // For slave physical modems
         private IPacketRouter? InnerRouter = null;
         private bool AddressWasSetByUpperNode = false; // SMLA or not
-        private bool IsProcessingMessage = false; // Flag to prevent working on the same packet more than 1 time.
         private bool InternalModemConnected = false;
         private bool WebSocketOrSocketIO = false; // false if socket.io, true if websocket
         private PacketQueueAssembler QueueAssembler = new(1000000, 600000000);
@@ -134,9 +129,9 @@ namespace ModemAPI
                 return;
             }
             QueueAssembler.AddPacket(p);
-            DataBlock? possibleAssembledPacketQueue = QueueAssembler.GetPacketQueue(p.MessageId)?.Assemble();
+            DataBlock? possibleAssembledPacketQueue = QueueAssembler.GetPacketQueue(p.Transmitter, p.MessageId)?.Assemble();
             // only the call that removed the queue delivers it, so a data block is never delivered twice
-            if (possibleAssembledPacketQueue != null && QueueAssembler.RemovePacketQueue(p.MessageId))
+            if (possibleAssembledPacketQueue != null && QueueAssembler.RemovePacketQueue(p.Transmitter, p.MessageId))
             {
                 DataBlockSubscribers.Invoke(possibleAssembledPacketQueue, k);
             }
@@ -329,7 +324,8 @@ namespace ModemAPI
                 {
                     return; // ttl too low
                 }
-                data.RoutersToPass--;
+                // a copy: the received packet is shared by every subscriber of the event
+                data = ForwardedCopy(data);
                 if (InnerRouter != null && InnerRouter.Decide(new(data.Transmitter, data.Receiver), PacketTransmissionDirection.FromUpperToLower) == PacketRouterDecidion.ForwardDown)
                 {
                     Transmit(data);
@@ -355,7 +351,7 @@ namespace ModemAPI
                     {
                         return; // ttl too low
                     }
-                    receivedPacket.RoutersToPass--;
+                    receivedPacket = ForwardedCopy(receivedPacket);
                     ModemAPIDebugger.OutputDebugMessage("forward ok");
                     receivedPacket.Metadata ??= "";
                     if (InnerRouter != null && InnerRouter.Decide(new(receivedPacket.Transmitter, receivedPacket.Receiver), PacketTransmissionDirection.FromLowerToUpper) == PacketRouterDecidion.ForwardInInnerNetwork)
@@ -422,7 +418,8 @@ namespace ModemAPI
                 {
                     return; // ttl too low
                 }
-                data.RoutersToPass--;
+                // a copy: the received packet is shared by every subscriber of the event
+                data = ForwardedCopy(data);
                 if (InnerRouter != null && InnerRouter.Decide(new(data.Transmitter, data.Receiver), PacketTransmissionDirection.FromUpperToLower) == PacketRouterDecidion.ForwardDown)
                 {
                     Transmit(data);
@@ -448,7 +445,7 @@ namespace ModemAPI
                     {
                         return; // ttl too low
                     }
-                    receivedPacket.RoutersToPass--;
+                    receivedPacket = ForwardedCopy(receivedPacket);
                     ModemAPIDebugger.OutputDebugMessage("forward ok");
                     receivedPacket.Metadata ??= "";
                     if (InnerRouter != null && InnerRouter.Decide(new(receivedPacket.Transmitter, receivedPacket.Receiver), PacketTransmissionDirection.FromLowerToUpper) == PacketRouterDecidion.ForwardInInnerNetwork)
@@ -1120,6 +1117,14 @@ namespace ModemAPI
                     await Task.Delay(2000);
                 }
             }
+        }
+
+        /// <summary>
+        /// A copy of the packet with one router less to pass. The received packet itself is shared by every subscriber of the event, so it must not change.
+        /// </summary>
+        private static Packet ForwardedCopy(Packet p)
+        {
+            return new Packet(p.Transmitter, p.Receiver, p.DataBytes, p.IsLastInSequence, p.Metadata, p.QueryType, p.ConnectionID, p.IsErrorWhileReading, p.PacketNo, p.MessageId, (ushort)(p.RoutersToPass - 1));
         }
 
         public void AttachPacketRouter(IPacketRouter router)

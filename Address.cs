@@ -20,14 +20,12 @@ namespace ModemAPI
 
         public bool Equals(Address? other)
         {
-            try
-            {
-                return AddressValue == other?.AddressValue;
-            }
-            catch
-            {
-                return false;
-            }
+            // an address is never equal to null, even when its own value is null
+            return other is not null && AddressValue == other.AddressValue;
+        }
+        public override bool Equals(object? obj)
+        {
+            return Equals(obj as Address);
         }
         /// <summary>
         /// Checks if an address is a valid tetronet address expression.
@@ -60,7 +58,7 @@ namespace ModemAPI
         }
         public override string ToString()
         {
-            return (AddressValue ?? "")[..];
+            return AddressValue ?? "";
         }
         /// <summary>
         /// Checks if an address is <see langword="null"/> or it's internal <see cref="AddressValue"/> is <see langword="null"/>

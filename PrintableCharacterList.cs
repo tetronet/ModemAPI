@@ -8,7 +8,7 @@
         /// <summary>
         /// Standart Printable Characters (used for Metadata).
         /// </summary>
-        public static readonly char[] PrintableCharacters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVXYZ+-/=^!@#$%&*()[]{}<>0123456789.:;\"'~`?_\\|\r\n".ToCharArray();
+        public static readonly char[] PrintableCharacters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+-/=^!@#$%&*()[]{}<>0123456789.:;\"'~`?_\\|\r\n".ToCharArray();
         /// <summary>
         /// Limited Printable Characters (used for Query Type).
         /// </summary>

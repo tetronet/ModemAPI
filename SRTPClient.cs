@@ -7,6 +7,10 @@ namespace ModemAPI
     public class SRTPClient
     {
         /// <summary>
+        /// The most data one message can carry: 8 bytes of the sequential number and the data have to fit into one tetronet packet.
+        /// </summary>
+        public const int MaxMessageLength = 59992;
+        /// <summary>
         /// Metadata of data packets sent by clients that understand batched acknowledgements. Older clients ignore metadata,
         /// so they keep receiving data as before and keep acknowledging every packet.
         /// </summary>
@@ -26,6 +30,7 @@ namespace ModemAPI
         private long SequentialPacketNumber = 0;
         private long LowestUnacknowledged = 0; // sender side: packets below this one are acknowledged
         private volatile bool IsClosed = false;
+        private int CloseStarted = 0;
         private int TicksTimeout;
         private ConcurrentDictionary<long, byte[]> ReorderingBuffer = new ConcurrentDictionary<long, byte[]>();
         private ConcurrentDictionary<long, ReliablePacketInformation> InternalState = new ConcurrentDictionary<long, ReliablePacketInformation>();
@@ -42,10 +47,28 @@ namespace ModemAPI
         private Stopwatch LastWindowHalvingTimer = Stopwatch.StartNew();
         private bool FailedDueToTooManyRetxAttepms = false;
         private double ThrottlingPower = 0.01;
+        // the window size is changed by the receiving thread and the retransmission thread
+        private readonly Lock CongestionLock = new();
+        // Transmit is called by any number of threads: the sequential number is taken and the packet sent under this lock
+        private readonly Lock TransmitLock = new();
+        private Action<SRTPClient, byte[]> MessageReceivedHandler = delegate { };
         /// <summary>
         /// Gets called for each received message by this client, and data of this message is sent to the event handler.
+        /// A session created by <see cref="SRTPServer"/> starts delivering messages when this is set.
         /// </summary>
-        public Action<SRTPClient, byte[]> OnMessageReceived = delegate { };
+        public Action<SRTPClient, byte[]> OnMessageReceived
+        {
+            get { return MessageReceivedHandler; }
+            set
+            {
+                MessageReceivedHandler = value;
+                // the application subscribed, so the messages held for it can go
+                if (DeliveryHeld)
+                {
+                    ReleaseDelivery();
+                }
+            }
+        }
         /// <summary>
         /// Gets called for each error in this client, where the errcode and text description are sent to the event handler.
         /// </summary>
@@ -93,7 +116,7 @@ namespace ModemAPI
         /// </summary>
         public int TicksPacketDelay = 0;
         /// <summary>
-        /// If set to true, this client will control the overload using Packet loss to prevent tetronet from doing OHHH MYY PCCCCAEAEAE
+        /// If set to true, this client controls the load using packet loss: the window shrinks on losses and grows on acknowledgements, so the tetronet doesn't get overloaded
         /// </summary>
         public bool PacketLossBasedCongestionControl = false;
         /// <summary>
@@ -148,9 +171,10 @@ namespace ModemAPI
             TicksTimeout = tickTimeout;
             // receiver task
             Modem.AttachReceiveEventNoUnfragment(OnPacketReceived);
-            // error correction task
+            // error correction task, also cleans the reordering buffer once a second
             _ = Task.Run(async delegate ()
             {
+                int round = 0;
                 while (!IsClosed)
                 {
                     try
@@ -159,30 +183,27 @@ namespace ModemAPI
                         {
                             if (info.CheckTimeout(TicksTimeout))
                             {
+                                // a packet gets exactly RetransmissionsBeforeConsideringRemoteSideDead retransmissions
+                                if (info.RetransmissionCounter >= RetransmissionsBeforeConsideringRemoteSideDead)
+                                {
+                                    FailedDueToTooManyRetxAttepms = true;
+                                    Close();
+                                    break;
+                                }
+                                info.RetransmissionCounter++;
                                 // retransmit packets
                                 UnivSend(info.Data, BatchedAckDataTag);
                                 // update timeout
                                 info.UpdateTimeStamp();
-                                // check the counter
-                                if (info.RetransmissionCounter > RetransmissionsBeforeConsideringRemoteSideDead)
-                                {
-                                    FailedDueToTooManyRetxAttepms = true;
-                                    Close();
-                                }
-                                // update retx counter
-                                info.RetransmissionCounter++;
                                 // if enabled, pause the transmission
-                                if (PacketLossBasedCongestionControl)
-                                {
-                                    if (LastWindowHalvingTimer.Elapsed.Ticks > TicksTimeout)
-                                    {
-                                        ThrottlingPower = Math.Clamp(ThrottlingPower / 2, 0.0001, 1);
-                                        LastWindowHalvingTimer.Restart();
-                                    }
-                                }
+                                HalveWindowOnLoss();
                                 // call the user event
                                 OnRetransmit(info.Id);
                             }
+                        }
+                        if (autoclear && ++round % 10 == 0)
+                        {
+                            ClearReorderingBuffer();
                         }
                         await Task.Delay(100);
                     }
@@ -210,18 +231,28 @@ namespace ModemAPI
                     await ReorderSignal.WaitAsync(Volatile.Read(ref UnacknowledgedPackets) > 0 ? AckDelayMilliseconds : 100);
                 }
             });
-            // autoclear task
-            if (autoclear)
-            {
-                _ = Task.Run(async delegate ()
-                {
-                    while (!IsClosed)
-                    {
-                        ClearReorderingBuffer();
-                        await Task.Delay(1000);
-                    }
-                });
-            }
+        }
+        // while set, received messages wait in the reordering buffer instead of going to OnMessageReceived
+        private volatile bool DeliveryHeld = false;
+        /// <summary>
+        /// Keeps received messages from being delivered until <see cref="ReleaseDelivery"/> or until <see cref="OnMessageReceived"/> is set,
+        /// so none of them goes to nobody before the application subscribed.
+        /// </summary>
+        internal void HoldDelivery()
+        {
+            DeliveryHeld = true;
+        }
+        internal void ReleaseDelivery()
+        {
+            DeliveryHeld = false;
+            WakeUpReorderTask();
+        }
+        /// <summary>
+        /// Handles a packet, that this client didn't get from the modem itself.
+        /// </summary>
+        internal void Receive(Packet packet)
+        {
+            OnPacketReceived(packet, delegate { });
         }
         private void OnPacketReceived(Packet packet, Action k)
         {
@@ -249,6 +280,11 @@ namespace ModemAPI
                     return;
                 }
                 long id = BinaryPrimitives.ReadInt64BigEndian(dataReceived);
+                if (id < 0)
+                {
+                    OnError(17, $"Packet with a negative sequential number {id}.");
+                    return;
+                }
 
                 if (dataReceived.Length == 8)
                 {
@@ -351,7 +387,7 @@ namespace ModemAPI
                 {
                     LowestUnacknowledged = upTo + 1;
                 }
-                for (int bit = 0; bit < (acknowledgement.Length - 8) * 8; bit++)
+                for (int bit = 0; bit < Math.Min((acknowledgement.Length - 8) * 8, SelectiveAckBits); bit++)
                 {
                     if ((acknowledgement[8 + bit / 8] & (1 << (bit % 8))) != 0 && InternalState.TryRemove(cumulative + 1 + bit, out _))
                     {
@@ -376,11 +412,7 @@ namespace ModemAPI
                     info.UpdateTimeStamp();
                     OnRetransmit(info.Id);
                 }
-                if (PacketLossBasedCongestionControl && LastWindowHalvingTimer.Elapsed.Ticks > TicksTimeout)
-                {
-                    ThrottlingPower = Math.Clamp(ThrottlingPower / 2, 0.0001, 1);
-                    LastWindowHalvingTimer.Restart();
-                }
+                HalveWindowOnLoss();
             }
         }
         /// <summary>
@@ -390,7 +422,7 @@ namespace ModemAPI
         /// <returns>Packets to retransmit right away or null</returns>
         private List<ReliablePacketInformation>? FindLostPackets(byte[] acknowledgement, long cumulative)
         {
-            int bits = (acknowledgement.Length - 8) * 8;
+            int bits = Math.Min((acknowledgement.Length - 8) * 8, SelectiveAckBits);
             long highestReported = -1;
             for (int bit = bits - 1; bit >= 0; bit--)
             {
@@ -434,11 +466,32 @@ namespace ModemAPI
                 LowestUnacknowledged++;
             }
         }
+        /// <summary>
+        /// With <see cref="PacketLossBasedCongestionControl"/>, halves the window on a loss, but not more often than once per timeout.
+        /// </summary>
+        private void HalveWindowOnLoss()
+        {
+            if (!PacketLossBasedCongestionControl)
+            {
+                return;
+            }
+            lock (CongestionLock)
+            {
+                if (LastWindowHalvingTimer.Elapsed.Ticks > TicksTimeout)
+                {
+                    ThrottlingPower = Math.Clamp(ThrottlingPower / 2, 0.0001, 1);
+                    LastWindowHalvingTimer.Restart();
+                }
+            }
+        }
         private void AcknowledgementsReceived(int count)
         {
             if (PacketLossBasedCongestionControl)
             {
-                ThrottlingPower = Math.Clamp(ThrottlingPower + 0.1 * count / MaxUnackedPackets, 0.0001, 1);
+                lock (CongestionLock)
+                {
+                    ThrottlingPower = Math.Clamp(ThrottlingPower + 0.1 * count / MaxUnackedPackets, 0.0001, 1);
+                }
             }
             // free slots in the window: wake up Transmit and WaitForAcknowledgements
             lock (WindowLock)
@@ -540,29 +593,43 @@ namespace ModemAPI
                 }
             }
         }
+        /// <summary>
+        /// Sends a message. Can be called from several threads at once: every message gets its own sequential number, and the
+        /// messages are delivered in the order their calls took the numbers.
+        /// </summary>
+        /// <exception cref="OperationCanceledException">The remote side is considered dead (too many retransmissions)</exception>
+        /// <exception cref="InvalidOperationException">The client was closed</exception>
+        /// <exception cref="TimeoutException">The window stayed full for <see cref="TransmitTimeOutInTicks"/></exception>
+        /// <exception cref="ArgumentOutOfRangeException">data is empty or longer than <see cref="MaxMessageLength"/></exception>
         public void Transmit(byte[] data)
         {
-            if (IsClosed)
-            {
-                throw new InvalidOperationException("This client is in an invalid state \"Closed\". To transmit data, it must be in state \"Opened\"");
-            }
+            // the cause of the failure is reported before the fact that the client got closed because of it
             if (FailedDueToTooManyRetxAttepms)
             {
                 Close();
                 throw new OperationCanceledException("Client was cancelled by the retransmission thread: too many retransmission attempts.");
             }
-            if (data.Length > 59992 || data.Length == 0)
+            if (IsClosed)
             {
-                throw new ArgumentOutOfRangeException(nameof(data), "data must contain not more than 59992 bytes and not less than 1 byte");
+                throw new InvalidOperationException("This client is in an invalid state \"Closed\". To transmit data, it must be in state \"Opened\"");
             }
-            // wait for a free slot in the window, acknowledgements wake this thread up
-            WaitForWindow(delegate () { return SequentialPacketNumber - Volatile.Read(ref LowestUnacknowledged) < CurrentWindow; });
+            if (data.Length > MaxMessageLength || data.Length == 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(data), $"data must contain not more than {MaxMessageLength} bytes and not less than 1 byte");
+            }
             byte[] data_ = new byte[data.Length + 8];
-            BinaryPrimitives.WriteInt64BigEndian(data_.AsSpan(), SequentialPacketNumber);
             data.CopyTo(data_, 8);
-            InternalState.TryAdd(SequentialPacketNumber, new(SequentialPacketNumber, DateTime.Now.Ticks, data_));
-            Interlocked.Increment(ref SequentialPacketNumber);
-            UnivSend(data_, BatchedAckDataTag);
+            lock (TransmitLock)
+            {
+                // wait for a free slot in the window, acknowledgements wake this thread up
+                WaitForWindow(delegate () { return SequentialPacketNumber - Volatile.Read(ref LowestUnacknowledged) < CurrentWindow; });
+                long id = SequentialPacketNumber;
+                BinaryPrimitives.WriteInt64BigEndian(data_.AsSpan(), id);
+                // added before the number is counted: everything below SequentialPacketNumber is waiting or acknowledged
+                InternalState.TryAdd(id, new(id, Stopwatch.GetTimestamp(), data_));
+                Interlocked.Increment(ref SequentialPacketNumber);
+                UnivSend(data_, BatchedAckDataTag);
+            }
         }
         /// <summary>
         /// Blocks until the remote side acknowledges every transmitted packet. Call it before <see cref="Close"/>, otherwise
@@ -582,7 +649,8 @@ namespace ModemAPI
             {
                 lock (WindowLock)
                 {
-                    if (isReady())
+                    // checked before isReady: Close() empties the unacknowledged packets, which must not look like "everything acknowledged"
+                    if (!IsClosed && !FailedDueToTooManyRetxAttepms && isReady())
                     {
                         return;
                     }
@@ -607,6 +675,11 @@ namespace ModemAPI
         }
         public void Close()
         {
+            // the retransmission thread, Transmit and the owner can all close the client, but it closes only once
+            if (Interlocked.Exchange(ref CloseStarted, 1) == 1)
+            {
+                return;
+            }
             if (!IsClosed && Volatile.Read(ref UnacknowledgedPackets) > 0)
             {
                 // don't leave the sender waiting for a delayed acknowledgement, that will never come
@@ -621,7 +694,7 @@ namespace ModemAPI
             {
                 Monitor.PulseAll(WindowLock);
             }
-            OnMessageReceived = delegate { };
+            MessageReceivedHandler = delegate { };
             OnClose(this);
         }
         public bool WasPacketReceived(long packno)
@@ -681,7 +754,7 @@ namespace ModemAPI
         }
         private void ForceReadAllAvailablePackets()
         {
-            while (true)
+            while (!DeliveryHeld)
             {
                 byte[]? dataFromBuffer;
                 bool acknowledge = false;
@@ -702,7 +775,7 @@ namespace ModemAPI
                         acknowledge = UnacknowledgedPackets >= AckEveryPackets;
                     }
                 }
-                OnMessageReceived(this, dataFromBuffer[8..]); // call user events
+                MessageReceivedHandler(this, dataFromBuffer[8..]); // call user events
                 if (acknowledge)
                 {
                     SendBatchedAcknowledgement();
