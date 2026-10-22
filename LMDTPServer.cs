@@ -25,7 +25,8 @@ namespace ModemAPI
         private readonly Dictionary<(Address, uint), (Queue<uint> Ids, long LastSeen)> RecentRequestIds = [];
         private readonly Lock RecentRequestIdsLock = new();
         private const int RequestIdsPerClient = 16;
-        private static readonly TimeSpan RequestIdLifetime = TimeSpan.FromMinutes(10);
+        // the most clients, whose request IDs are remembered; over it the quarter, that asked longest ago, is forgotten at once
+        private const int MaxClientsWithRequestIds = 4096;
         private readonly Lock StartLock = new();
         private bool IsListBlackOrWhite;
         private uint ConnectionIDRangeStart;
@@ -166,7 +167,8 @@ namespace ModemAPI
                     return;
                 }
                 (Address, uint) key = (p.Transmitter, p.ConnectionID);
-                if (TryReadRequestId(p.DataBytes, out uint requestId) && !RememberRequestId(key, requestId))
+                bool hasRequestId = TryReadRequestId(p.DataBytes, out uint requestId);
+                if (hasRequestId && WasRequestSeen(key, requestId))
                 {
                     // the same request again: a duplicate on the way or a late copy; it is answered already (or being answered)
                     return;
@@ -203,6 +205,11 @@ namespace ModemAPI
                 // A new request from the same address and ConnectionID means the client is done with the previous one: it gave up,
                 // or it finished and asked again before the server saw its last acknowledgement. The old session ends and the new
                 // one takes its place. Sessions are created here on the modem's thread, so requests are taken in the order they came.
+                // remembered only now: a request refused by the limits above hasn't been answered
+                if (hasRequestId)
+                {
+                    RememberRequestId(key, requestId);
+                }
                 if (Clients.TryGetValue(key, out SRTPClient? previous))
                 {
                     EndSession(key, previous);
@@ -245,7 +252,7 @@ namespace ModemAPI
             }
         }
         /// <summary>
-        /// Reads the request ID, that v2 clients put after the hash algorithms byte. Older clients don't send it.
+        /// Reads the request ID, that v2 clients put after the hash algorithms byte. Older clients don't send it, and 0 means "no ID" too.
         /// </summary>
         private static bool TryReadRequestId(byte[] data, out uint requestId)
         {
@@ -260,35 +267,37 @@ namespace ModemAPI
                 return false;
             }
             requestId = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(offset));
-            return true;
+            return requestId != 0;
+        }
+        /// <summary>
+        /// Tells if a request of a client was seen (and answered or refused) already.
+        /// </summary>
+        private bool WasRequestSeen((Address, uint) key, uint requestId)
+        {
+            lock (RecentRequestIdsLock)
+            {
+                return RecentRequestIds.TryGetValue(key, out (Queue<uint> Ids, long LastSeen) recent) && recent.Ids.Contains(requestId);
+            }
         }
         /// <summary>
         /// Remembers a request ID of a client.
         /// </summary>
-        /// <returns>false if this request was seen already</returns>
-        private bool RememberRequestId((Address, uint) key, uint requestId)
+        private void RememberRequestId((Address, uint) key, uint requestId)
         {
             long now = Stopwatch.GetTimestamp();
             lock (RecentRequestIdsLock)
             {
-                if (RecentRequestIds.Count > MaxSessions * 16)
+                if (!RecentRequestIds.TryGetValue(key, out (Queue<uint> Ids, long LastSeen) recent))
                 {
-                    // clients, that stopped asking long ago, are forgotten, so the table doesn't grow forever
-                    foreach (KeyValuePair<(Address, uint), (Queue<uint> Ids, long LastSeen)> old in RecentRequestIds.ToArray())
+                    if (RecentRequestIds.Count >= MaxClientsWithRequestIds)
                     {
-                        if (Stopwatch.GetElapsedTime(old.Value.LastSeen, now) > RequestIdLifetime)
+                        // a hard limit: the quarter, that asked longest ago, is forgotten in one go, so this happens rarely
+                        foreach (KeyValuePair<(Address, uint), (Queue<uint> Ids, long LastSeen)> old in RecentRequestIds.OrderBy(kv => kv.Value.LastSeen).Take(MaxClientsWithRequestIds / 4).ToArray())
                         {
                             RecentRequestIds.Remove(old.Key);
                         }
                     }
-                }
-                if (!RecentRequestIds.TryGetValue(key, out (Queue<uint> Ids, long LastSeen) recent))
-                {
                     recent = (new Queue<uint>(), now);
-                }
-                if (recent.Ids.Contains(requestId))
-                {
-                    return false;
                 }
                 recent.Ids.Enqueue(requestId);
                 if (recent.Ids.Count > RequestIdsPerClient)
@@ -296,7 +305,6 @@ namespace ModemAPI
                     recent.Ids.Dequeue();
                 }
                 RecentRequestIds[key] = (recent.Ids, now);
-                return true;
             }
         }
         private bool CheckGrayList(Address address)

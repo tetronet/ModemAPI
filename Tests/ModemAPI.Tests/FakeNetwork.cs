@@ -107,7 +107,7 @@ namespace ModemAPI.Tests
         // helpers for fault policies
 
         /// <summary>An SRTP acknowledgement of either version.</summary>
-        public static bool IsAck(Packet p) => p.Metadata == "srtp2a" || (p.Metadata != "srtp2" && p.DataBytes.Length == 8);
+        public static bool IsAck(Packet p) => SRTPClient.IsAcknowledgement(p);
 
         /// <summary>An SRTP message (data), not an acknowledgement and not an LMDTP request.</summary>
         public static bool IsData(Packet p) => !IsAck(p) && !IsLmdtpRequest(p) && p.DataBytes.Length > 8;

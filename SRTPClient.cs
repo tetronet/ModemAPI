@@ -16,10 +16,26 @@ namespace ModemAPI
         /// </summary>
         private const string BatchedAckDataTag = "srtp2";
         /// <summary>
+        /// Every message carries <see cref="BatchedAckDataTag"/>, ":" and the ID of its stream (8 hex digits), and batched
+        /// acknowledgements carry the ID of the stream they acknowledge. So an acknowledgement of one stream can't acknowledge another
+        /// one, and <see cref="SRTPServer"/> sees by any message, that a client started a new stream with the same ConnectionID.
+        /// Receivers, that don't know the ID, take such messages for v1 ones and acknowledge every message.
+        /// </summary>
+        private const string StreamDataTagPrefix = BatchedAckDataTag + ":";
+        // the ID of the stream this client sends
+        private readonly string StreamId = ((uint)Random.Shared.NextInt64(1, uint.MaxValue)).ToString("x8");
+        // metadata of every message of this client's stream
+        private readonly string StreamDataTag;
+        // the ID of the stream this client receives: the one of the first message that came; null while it's unknown, or the sender has none
+        private string? PeerStreamId = null;
+        // the moment the last packet of this session arrived (Stopwatch), for the idle timeout of SRTPServer
+        private long LastPacketTimestamp = Stopwatch.GetTimestamp();
+        /// <summary>
         /// Metadata of a batched acknowledgement: 8 bytes "every packet up to this number is delivered", followed by an
         /// optional bitmap of packets received after it (bit i = packet number + 1 + i). It is only sent to peers, whose data carried <see cref="BatchedAckDataTag"/>.
         /// </summary>
         private const string BatchedAckTag = "srtp2a";
+        private const string StreamAckTagPrefix = BatchedAckTag + ":";
         private const int SelectiveAckBits = 256;
         private Address? CommunicatingWith = null;
         private uint ConnectionID = 0;
@@ -54,14 +70,17 @@ namespace ModemAPI
         private Action<SRTPClient, byte[]> MessageReceivedHandler = delegate { };
         /// <summary>
         /// Gets called for each received message by this client, and data of this message is sent to the event handler.
-        /// A session created by <see cref="SRTPServer"/> starts delivering messages when this is set.
+        /// A session created by <see cref="SRTPServer"/> starts delivering messages when this is set. The handler runs on the
+        /// delivery thread of this client: if it throws, the message still counts as delivered, the exception goes to <see cref="OnError"/>
+        /// (code -2), and the following messages are delivered as usual.
         /// </summary>
         public Action<SRTPClient, byte[]> OnMessageReceived
         {
             get { return MessageReceivedHandler; }
             set
             {
-                MessageReceivedHandler = value;
+                // null means "nobody listens", not a crash on the next message
+                MessageReceivedHandler = value ?? delegate { };
                 // the application subscribed, so the messages held for it can go
                 if (DeliveryHeld)
                 {
@@ -164,6 +183,7 @@ namespace ModemAPI
 
         public SRTPClient(IModem modem, Address dst, string qt, uint cid, int tickTimeout, bool autoclear = true)
         {
+            StreamDataTag = StreamDataTagPrefix + StreamId;
             ConnectionID = cid;
             QueryType = qt;
             Modem = modem;
@@ -192,7 +212,7 @@ namespace ModemAPI
                                 }
                                 info.RetransmissionCounter++;
                                 // retransmit packets
-                                UnivSend(info.Data, BatchedAckDataTag);
+                                UnivSend(info.Data, StreamDataTag);
                                 // update timeout
                                 info.UpdateTimeStamp();
                                 // if enabled, pause the transmission
@@ -247,6 +267,42 @@ namespace ModemAPI
             DeliveryHeld = false;
             WakeUpReorderTask();
         }
+        private volatile bool SkipFinalAcknowledgement = false;
+        /// <summary>
+        /// Closes a session, whose remote side already started a new stream with the same ConnectionID: an acknowledgement of the
+        /// old stream must not reach the new one, where it would acknowledge messages, that weren't received.
+        /// </summary>
+        internal void CloseWithoutFinalAcknowledgement()
+        {
+            SkipFinalAcknowledgement = true;
+            Close();
+        }
+        private static bool IsBatchedAckData(string? metadata)
+        {
+            return metadata == BatchedAckDataTag || (metadata != null && metadata.StartsWith(StreamDataTagPrefix, StringComparison.Ordinal));
+        }
+        /// <summary>
+        /// The stream ID of a message, or null, if the sender didn't put one (older senders, or the metadata got lost on the way).
+        /// </summary>
+        internal static string? StreamIdOf(Packet packet)
+        {
+            return packet.Metadata != null && packet.Metadata.StartsWith(StreamDataTagPrefix, StringComparison.Ordinal) ? packet.Metadata[StreamDataTagPrefix.Length..] : null;
+        }
+        /// <summary>
+        /// An SRTP acknowledgement of either version.
+        /// </summary>
+        internal static bool IsAcknowledgement(Packet packet)
+        {
+            return (packet.Metadata != null && packet.Metadata.StartsWith(BatchedAckTag, StringComparison.Ordinal)) ||
+                (!IsBatchedAckData(packet.Metadata) && packet.DataBytes.Length == 8);
+        }
+        /// <summary>
+        /// How long ago the last packet of this session arrived.
+        /// </summary>
+        internal TimeSpan TimeSinceLastPacket
+        {
+            get { return Stopwatch.GetElapsedTime(Volatile.Read(ref LastPacketTimestamp)); }
+        }
         /// <summary>
         /// Handles a packet, that this client didn't get from the modem itself.
         /// </summary>
@@ -265,12 +321,22 @@ namespace ModemAPI
                 ModemAPIDebugger.OutputDebugMessage("SRTPClient MISMATCH CID OR QT!!!!!!!!!");
                 return;
             }
+            Volatile.Write(ref LastPacketTimestamp, Stopwatch.GetTimestamp());
             try
             {
                 byte[] dataReceived = packet.DataBytes;
                 if (packet.Metadata == BatchedAckTag)
                 {
                     HandleBatchedAcknowledgement(dataReceived);
+                    return;
+                }
+                if (packet.Metadata != null && packet.Metadata.StartsWith(StreamAckTagPrefix, StringComparison.Ordinal))
+                {
+                    // an acknowledgement of another stream (for example of an older client with the same ConnectionID) acknowledges nothing here
+                    if (packet.Metadata.AsSpan(StreamAckTagPrefix.Length).SequenceEqual(StreamId))
+                    {
+                        HandleBatchedAcknowledgement(dataReceived);
+                    }
                     return;
                 }
                 // parse received packet
@@ -301,11 +367,25 @@ namespace ModemAPI
                     return;
                 }
                 // == enqueue packets ==
-                bool batched = packet.Metadata == BatchedAckDataTag;
+                bool batched = IsBatchedAckData(packet.Metadata);
+                string? streamId = StreamIdOf(packet);
                 bool tooDeep = false;
                 bool acknowledgeNow = !batched; // older peers expect an acknowledgement for every packet
                 lock (ReceiveLock)
                 {
+                    if (streamId != null)
+                    {
+                        if (PeerStreamId == null)
+                        {
+                            PeerStreamId = streamId;
+                        }
+                        else if (streamId != PeerStreamId)
+                        {
+                            // a message of another stream: the sender started over with the same ConnectionID. Acknowledging it here
+                            // as a repeat would lose it, so it is neither acknowledged nor delivered (SRTPServer opens a new session for it).
+                            return;
+                        }
+                    }
                     if (batched)
                     {
                         PeerUsesBatchedAcks = true;
@@ -408,7 +488,7 @@ namespace ModemAPI
                 // fast retransmit: the holes are resent now instead of after TicksTimeout
                 foreach (ReliablePacketInformation info in lost)
                 {
-                    UnivSend(info.Data, BatchedAckDataTag);
+                    UnivSend(info.Data, StreamDataTag);
                     info.UpdateTimeStamp();
                     OnRetransmit(info.Id);
                 }
@@ -503,12 +583,15 @@ namespace ModemAPI
         {
             byte[] acknowledgement;
             long cumulative;
+            string tag;
             lock (ReceiveLock)
             {
                 if (!PeerUsesBatchedAcks)
                 {
                     return;
                 }
+                // tells which stream is acknowledged; senders without a stream ID (older ones) get the plain tag they know
+                tag = PeerStreamId != null ? StreamAckTagPrefix + PeerStreamId : BatchedAckTag;
                 UnacknowledgedPackets = 0;
                 OutOfOrderSinceAcknowledgement = 0;
                 // only delivered packets are acknowledged as a whole, so the sender can't get further ahead of the
@@ -533,7 +616,7 @@ namespace ModemAPI
                 BinaryPrimitives.WriteInt64BigEndian(acknowledgement, cumulative);
                 bitmap[..bitmapLength].CopyTo(acknowledgement.AsSpan(8));
             }
-            UnivSend(acknowledgement, BatchedAckTag);
+            UnivSend(acknowledgement, tag);
             OnAckTransmitted(cumulative);
         }
         private void SendDelayedAcknowledgement()
@@ -628,7 +711,7 @@ namespace ModemAPI
                 // added before the number is counted: everything below SequentialPacketNumber is waiting or acknowledged
                 InternalState.TryAdd(id, new(id, Stopwatch.GetTimestamp(), data_));
                 Interlocked.Increment(ref SequentialPacketNumber);
-                UnivSend(data_, BatchedAckDataTag);
+                UnivSend(data_, StreamDataTag);
             }
         }
         /// <summary>
@@ -680,7 +763,7 @@ namespace ModemAPI
             {
                 return;
             }
-            if (!IsClosed && Volatile.Read(ref UnacknowledgedPackets) > 0)
+            if (!IsClosed && !SkipFinalAcknowledgement && Volatile.Read(ref UnacknowledgedPackets) > 0)
             {
                 // don't leave the sender waiting for a delayed acknowledgement, that will never come
                 SendBatchedAcknowledgement();
@@ -775,7 +858,15 @@ namespace ModemAPI
                         acknowledge = UnacknowledgedPackets >= AckEveryPackets;
                     }
                 }
-                MessageReceivedHandler(this, dataFromBuffer[8..]); // call user events
+                try
+                {
+                    MessageReceivedHandler(this, dataFromBuffer[8..]); // call user events
+                }
+                catch (Exception e)
+                {
+                    // the message counts as delivered (it was handed over), and the next ones go on being delivered
+                    OnError(-2, "OnMessageReceived threw an exception: " + e);
+                }
                 if (acknowledge)
                 {
                     SendBatchedAcknowledgement();

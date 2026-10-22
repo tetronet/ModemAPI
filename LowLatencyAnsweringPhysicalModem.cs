@@ -74,6 +74,10 @@ namespace ModemAPI
             private L1Types t;
             private List<byte> L1RxBuffer = [];
             public Action<Exception> ErrorReported = delegate { };
+            // UDP: whether a new subscriber may take the line now (the modem says so while it has no active connection)
+            public Func<bool> CanTakeNewSubscriber = () => true;
+            // UDP: where the subscriber sends from; the answers go there
+            private volatile IPEndPoint? UdpPeer;
 
             public PNetworkCommunicator(TcpListener? tcp, UdpClient? udp, ISerialPacket? sp)
             {
@@ -160,9 +164,9 @@ namespace ModemAPI
                 while (true)
                 {
                     byte[] datagram;
+                    IPEndPoint? ep = null;
                     try
                     {
-                        IPEndPoint? ep = null;
                         // one datagram is one whole packet: a lost, repeated or reordered datagram affects only itself
                         datagram = udp.Receive(ref ep);
                         ModemAPIDebugger.OutputDebugMessage($"low latency physical modem received a datagram from {ep}");
@@ -177,6 +181,16 @@ namespace ModemAPI
                         // for example ICMP "port unreachable" of an earlier datagram; the socket still works
                         ErrorReported(e);
                         continue;
+                    }
+                    // the line belongs to one subscriber: anybody can send a datagram to this port (with any source address), so only
+                    // a valid connection request, while there is no connection, may make another address the one answered
+                    if (!ep!.Equals(UdpPeer))
+                    {
+                        if (!CanTakeNewSubscriber() || PacketConverter.ParseLowLatencyConnectionRequest(datagram).IsRequestDamaged)
+                        {
+                            continue;
+                        }
+                        UdpPeer = ep;
                     }
                     try
                     {
@@ -237,7 +251,8 @@ namespace ModemAPI
                         throw new ArgumentOutOfRangeException(nameof(data), $"a packet sent over UDP must not be longer than {L1Framing.MaxDatagramLength} bytes");
                     }
                     // the whole packet is one datagram, without a length header: UDP keeps datagrams whole, and losing one loses only that packet
-                    udp.Send(data);
+                    IPEndPoint peer = UdpPeer ?? throw new NullTransmitterException("udp: nothing has come from the subscriber yet, so there is nowhere to answer");
+                    udp.Send(data, data.Length, peer);
                 }
             }
             /// <summary>
@@ -312,9 +327,14 @@ namespace ModemAPI
             }
             else if (wt == L1Types.L1_INET_UDP)
             {
-                UdpClient client = new();
-                client.Connect(IPAddress.Parse(wire.Split(':')[0]), int.Parse(wire.Split(':')[1]));
-                client.Client.Bind(new IPEndPoint(IPAddress.Parse(wire.Split(':')[0]), int.Parse(wire.Split(':')[1])));
+                // the answering side listens on its own address and port (like the TCP listener above), and answers whoever calls
+                UdpClient client = new(new IPEndPoint(IPAddress.Parse(wire.Split(':')[0]), int.Parse(wire.Split(':')[1])));
+                if (OperatingSystem.IsWindows())
+                {
+                    // without this an ICMP "port unreachable" for an earlier answer makes the next Receive throw
+                    const int SIO_UDP_CONNRESET = -1744830452;
+                    client.Client.IOControl(SIO_UDP_CONNRESET, [0, 0, 0, 0], null);
+                }
                 Communicator = new(null, client, null);
             }
             else
@@ -323,6 +343,7 @@ namespace ModemAPI
             }
             Communicator.Init(wt);
             Communicator.ErrorReported = delegate (Exception e) { InternalErrorHappened(e, ErrorEmitter.LowLatencyAnsweringPhysicalModem); };
+            Communicator.CanTakeNewSubscriber = delegate () { return !HasActiveConnection; };
             Communicator.OnDataRead(delegate (byte[] d, Action k)
             {
                 if (!HasActiveConnection)
@@ -361,6 +382,7 @@ namespace ModemAPI
             Communicator = new(null, null, mssp);
             Communicator.Init(L1Types.L1_SERIAL);
             Communicator.ErrorReported = delegate (Exception e) { InternalErrorHappened(e, ErrorEmitter.LowLatencyAnsweringPhysicalModem); };
+            Communicator.CanTakeNewSubscriber = delegate () { return !HasActiveConnection; };
             Communicator.OnDataRead(delegate (byte[] d, Action k)
             {
                 if (!HasActiveConnection)

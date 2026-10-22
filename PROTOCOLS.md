@@ -130,8 +130,11 @@ A reliable, ordered stream of messages between two tetronet addresses. There's n
 ```
 ##### v2: batched and selective acknowledgements
 ```
-A v2 sender puts "srtp2" into the metadata of the tetronet packets with its messages, the format of the messages doesn't change.
-A receiver, that got a message with "srtp2", answers with v2 acknowledgements, with "srtp2a" in the metadata:
+A v2 sender puts "srtp2:" and the ID of its stream (8 random hex digits, picked once per stream) into the metadata of the
+tetronet packets with its messages, for example "srtp2:1f0c93a7"; the format of the messages doesn't change. (Senders of an earlier
+v2 put just "srtp2", without an ID.)
+A receiver, that got a message with "srtp2" or "srtp2:<ID>", answers with v2 acknowledgements, with "srtp2a:<ID>" in the metadata
+("srtp2a" to a sender without an ID):
 +--------------------------------------------------------------------------------------+
 | (8 bytes signed: every message up to this number is delivered, -1 - nothing yet)     |
 | (0-32 bytes bitmap*: bit i is set - message (number + 1 + i) is received)            |
@@ -144,6 +147,9 @@ The receiver sends a v2 acknowledgement:
 * right away, when a repeated message arrives
 * after a gap in the sequential numbers: when the 3rd message after the gap arrives, and then after every 4 more, until the gap is filled (counted since the last acknowledgement)
 * when the session is closed, if something isn't acknowledged yet
+
+The receiver takes the stream of the first message it got: messages with another stream ID are neither acknowledged nor delivered.
+A sender ignores acknowledgements with another stream ID, so an acknowledgement of one stream never acknowledges messages of another.
 
 The sender:
 * sends messages only while (next sequential number - first unacknowledged number) < 1024 (MaxUnackedPackets, less with the packet loss based congestion control); messages, that are only marked in the bitmap, don't move this window, they are received, but not delivered yet
@@ -162,6 +168,12 @@ The sender:
 +-----------+-------------+------------------------------------------------------------------+
 * v1 and v2 acknowledgements are told apart by the metadata, not by the length: a v2 acknowledgement without the bitmap is 8 bytes long too
 * If something on the route drops the metadata of every packet, both sides stay on v1
+* There is no message for closing a stream. A client, that starts over with the same address and ConnectionID (it restarted or
+  reconnected), just sends the messages of a new stream: a server ends the session of the old stream on any message with another
+  stream ID (message 0 may be lost or come later), and opens a session for the new stream, when its message 0 comes. From senders
+  without a stream ID, only a message 0 with other contents tells a new stream
+* Receivers of a v1 or an earlier v2 don't know "srtp2:<ID>": they take such messages for v1 ones and acknowledge every message,
+  which a v2 sender accepts
 ```
 ### LMDTP, aka Large Message Direct Tunnel Protocol
 Downloads a resource (a file or any other data) straight from the server, which has it, through an SRTP session. The query type of every packet is "lm_tunnel".
@@ -190,7 +202,7 @@ SRTP session from the server to the client with the same ConnectionID
 | HASH: one message with the 64 bytes SHA-512 of the resource         |
 +---------------------------------------------------------------------+
 * The ConnectionID of the request must be in the range of the server. A v2 server has one session per client address and ConnectionID: a new request from them ends the session in progress (the client gave it up or is already done with it) and gets a new one
-* A v2 client picks a new random request ID (not 0) for every request. A v2 server remembers the last request IDs of every client address and ConnectionID, and ignores a request with an ID it has seen: that's a duplicate or a late copy, and answering it again would restart or replace the answer in progress. Requests without an ID (v1 clients) are always taken
+* A v2 client picks a new random request ID (not 0, which means "no ID") for every request. A v2 server remembers the last request IDs of every client address and ConnectionID, and ignores a request with an ID it has seen: that's a duplicate or a late copy, and answering it again would restart or replace the answer in progress. Requests without an ID (v1 clients) are always taken
 * The request is sent once, without retransmission: if it gets lost, the client times out (5 seconds by default)
 * OBTAIN: the hash is the hash of the resource data, the client checks it after receiving the last byte
 * HASH: the hash in the header is SHA-512 of the 64 bytes in the next message, and the length is 64
