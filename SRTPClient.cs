@@ -28,6 +28,13 @@ namespace ModemAPI
         private readonly string StreamDataTag;
         // the ID of the stream this client receives: the one of the first message that came; null while it's unknown, or the sender has none
         private string? PeerStreamId = null;
+        // the last foreign stream reported through OnError, so every new one is reported once
+        private string? ReportedForeignStreamId = null;
+        /// <summary>
+        /// Whether messages of another stream are reported through <see cref="OnError"/>; off for sessions of <see cref="SRTPServer"/>,
+        /// which opens a new session for the new stream itself.
+        /// </summary>
+        internal bool ReportsForeignStreams = true;
         // the moment the last packet of this session arrived (Stopwatch), for the idle timeout of SRTPServer
         private long LastPacketTimestamp = Stopwatch.GetTimestamp();
         /// <summary>
@@ -369,11 +376,11 @@ namespace ModemAPI
                 // == enqueue packets ==
                 bool batched = IsBatchedAckData(packet.Metadata);
                 string? streamId = StreamIdOf(packet);
-                bool tooDeep = false;
-                bool acknowledgeNow = !batched; // older peers expect an acknowledgement for every packet
-                lock (ReceiveLock)
+                if (streamId != null)
                 {
-                    if (streamId != null)
+                    bool foreign = false;
+                    bool firstOfThisStream = false;
+                    lock (ReceiveLock)
                     {
                         if (PeerStreamId == null)
                         {
@@ -381,11 +388,27 @@ namespace ModemAPI
                         }
                         else if (streamId != PeerStreamId)
                         {
-                            // a message of another stream: the sender started over with the same ConnectionID. Acknowledging it here
-                            // as a repeat would lose it, so it is neither acknowledged nor delivered (SRTPServer opens a new session for it).
-                            return;
+                            foreign = true;
+                            firstOfThisStream = streamId != ReportedForeignStreamId;
+                            ReportedForeignStreamId = streamId;
                         }
                     }
+                    if (foreign)
+                    {
+                        // a message of another stream: the sender started over with the same ConnectionID. Acknowledging it here
+                        // as a repeat would lose it, so it is neither acknowledged nor delivered (SRTPServer opens a new session for it;
+                        // anybody else learns about it once per new stream, so it can create a new client)
+                        if (firstOfThisStream && ReportsForeignStreams)
+                        {
+                            OnError(18, $"The remote side started a new stream ({streamId}) with the same ConnectionID, its messages are ignored by this client, which belongs to stream {PeerStreamId}. Create a new SRTPClient to receive it.");
+                        }
+                        return;
+                    }
+                }
+                bool tooDeep = false;
+                bool acknowledgeNow = !batched; // older peers expect an acknowledgement for every packet
+                lock (ReceiveLock)
+                {
                     if (batched)
                     {
                         PeerUsesBatchedAcks = true;

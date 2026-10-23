@@ -277,12 +277,16 @@ namespace ModemAPI
             });
         }*/
         /// <summary>
-        /// Creates a new slave modem for that Virtual Modem. Works only with L1_SERIAL wireType.
+        /// Creates a new slave modem for that Virtual Modem. Works with L1_SERIAL and L1_INET_UDP wireTypes; for TCP use
+        /// <see cref="CreateSlave(Stream, string)"/> with the stream of every connection your own TcpListener accepts.
         /// </summary>
-        /// <param name="serialPortNumber">Serial port of that slave</param>
-        /// <param name="portSpeed">Bitrate</param>
-        /// <param name="wireType">L1 type</param>
-        /// <exception cref="InvalidOperationException">Happens if slave being created without connecting as an Address Machine</exception>
+        /// <param name="serialPortNumber">L1_SERIAL: serial port of that slave (for example "COM3"). L1_INET_UDP: "ip:port", that the
+        /// slave listens on (for example "0.0.0.0:5000")</param>
+        /// <param name="portSpeed">L1_SERIAL: bitrate. Not used with L1_INET_UDP</param>
+        /// <param name="wireType">L1 type: L1_SERIAL or L1_INET_UDP</param>
+        /// <param name="useMoreStableSerialPacket">L1_SERIAL: frame the line with MSSP. Not used with L1_INET_UDP</param>
+        /// <exception cref="InvalidOperationException">Happens if slave being created without connecting as an Address Machine, or with
+        /// another wireType (TCP)</exception>
         /// <exception cref="NullReferenceException">Happens if serial port of that modem is NULL</exception>
         /// <exception cref="NullAddressException">Happens if slave is being created while the tetronet address of that modem is NULL</exception>
         public void CreateSlave(string serialPortNumber, int portSpeed, L1Types wireType, bool useMoreStableSerialPacket = false)
@@ -292,7 +296,7 @@ namespace ModemAPI
                 throw new InvalidOperationException("to create slaves this modem must be connected as an address machine");
             }
             LowLatencyAnsweringPhysicalModem prepare;
-            if (wireType == L1Types.L1_SERIAL)
+            if (wireType == L1Types.L1_SERIAL || wireType == L1Types.L1_INET_UDP)
             {
                 prepare = new(serialPortNumber, portSpeed, wireType, SlaveLargeMessageExchangeDirectory, useMoreStableSerialPacket);
             }

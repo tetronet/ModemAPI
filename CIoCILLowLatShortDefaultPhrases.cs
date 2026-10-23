@@ -20,5 +20,14 @@
         /// Disconnection response when the Remote Address Machine accepts disconnection for the Client's Modem.
         /// </summary>
         public static readonly byte[] DisconnectionResponse = [0x4c, 0x4c, 0x53, 0x74, 0x65, 0x72, 0x6d, 0x6f, 0x6b];
+        // === MODEM-KEEPALIVE ===
+        /// <summary>
+        /// Modem-KeepAlive, that the answering modem sends to its subscriber every third of the connection timeout.
+        /// </summary>
+        public static readonly byte[] KeepAliveRequest = [0x77, 0x99, 0x77, 0x99];
+        /// <summary>
+        /// The subscriber's answer to <see cref="KeepAliveRequest"/>.
+        /// </summary>
+        public static readonly byte[] KeepAliveResponse = [0x22, 0xFF, 0x22, 0xFF];
     }
 }

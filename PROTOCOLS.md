@@ -73,7 +73,14 @@ Large Messages in the tetronet are considered deprecated, consider using LMDTPSe
 ```
 ##### Keep-alive
 ```
-Sometimes is used, to know if one of the sides died to prevent desyncing states. For example if 3 keep-alives in a row receive a timeout, that can mean that the address machine is dead, and if the address machine doesn't receive the keep-alives for example for 120 seconds, it means the endpoint is dead and the states could be cleaned up.
+Modem-KeepAlive tells both sides, that the other one is still there, so a connection lost without a disconnection request doesn't stay "connected" forever.
+* The address machine (the answering modem) sends 0x77997799 every third of the connection timeout, that it gave in its connection response; the subscriber (the calling modem) answers 0x22FF22FF. The subscriber never sends 0x77997799 itself
+* A Modem-KeepAlive counts as answered, if anything came from the subscriber before the next one is sent: its answer or any other data
+* After 3 (configurable) Modem-KeepAlives in a row without an answer, the answering modem considers the connection lost, stops sending them and is ready for a new connection; the subscriber isn't told. Unanswered ones in between answered ones don't count: ok, lost, ok, ok, lost, ok is alive; ok, lost, lost, lost is lost
+* The subscriber considers the connection lost, when nothing (Modem-KeepAlive or any other data) came from the answering modem for the whole timeout, and can connect again
+* A timeout of 0 means no Modem-KeepAlive at all
+* A connection response without the timeout (flag 0b00100000 not set) means the same as a timeout of 0
+* Over UDP a connection request from another address or port (the same IP address too) is accepted only while there is no active connection and no connection request waiting to be answered (an unanswered one keeps the line for a while, 10 seconds by default), for example after Modem-KeepAlive found the connection lost; from the subscriber's own address and port it is accepted right away
 +------------+
 | 0x77997799 |
 +------------+

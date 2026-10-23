@@ -415,8 +415,8 @@ namespace ModemAPI
         {
             List<byte> responseCopy = [.. response];
             CIoCILLowLatShortResponseBody result = new CIoCILLowLatShortResponseBody();
-            // check if valid response
-            if (!response.Take(13).SequenceEqual(CIoCILLowLatShortDefaultPhrases.InitConnectionPrefixResponse))
+            // check if valid response: the prefix, the flags and the CRC at least
+            if (response.Length < 13 + 1 + 4 || !response.Take(13).SequenceEqual(CIoCILLowLatShortDefaultPhrases.InitConnectionPrefixResponse))
             {
                 result.IsResponseDamaged = true;
                 return result;
@@ -428,6 +428,7 @@ namespace ModemAPI
                 return result;
             }
             responseCopy.RemoveRange(0, 13);
+            responseCopy.RemoveRange(responseCopy.Count - 4, 4); // the CRC
             // read flags
             result.RemoteAddressMachineSupportsLargeMessageOperation = (response[13] & 0b00000001) != 0;
             result.ContainsSMLA = (response[13] & 0b00000010) != 0;
@@ -435,6 +436,14 @@ namespace ModemAPI
             result.SpecifiesLargeMessageMTU = (response[13] & 0b00010000) != 0;
             result.SpecifiesConnectionTimeoutInNanoseconds = (response[13] & 0b00100000) != 0;
             responseCopy.RemoveAt(0);
+            // every field the flags announce must fit into the response
+            int needed = (result.ContainsSMLA ? 1 + (responseCopy.Count > 0 ? responseCopy[0] : 0) : 0)
+                + (result.SpecifiesPacketMTU ? 2 : 0) + (result.SpecifiesLargeMessageMTU ? 8 : 0) + (result.SpecifiesConnectionTimeoutInNanoseconds ? 8 : 0);
+            if (responseCopy.Count < needed)
+            {
+                result.IsResponseDamaged = true;
+                return result;
+            }
             // read all available response fields
             if (result.ContainsSMLA) // read SMLA information
             {
@@ -485,6 +494,11 @@ namespace ModemAPI
             requestCopy.RemoveRange(0, 13);
             // get and parse address
             byte currentClientAddressLength = requestCopy[0];
+            if (requestCopy.Count < 1 + currentClientAddressLength + 1 + 4) // the address, the address machine flag and the CRC must fit
+            {
+                result.IsRequestDamaged = true;
+                return result;
+            }
             requestCopy.RemoveAt(0);
             result.CurrentClientAddress = new Address(Encoding.ASCII.GetString([.. requestCopy], 0, currentClientAddressLength));
             requestCopy.RemoveRange(0, currentClientAddressLength);

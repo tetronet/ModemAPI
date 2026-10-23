@@ -158,6 +158,8 @@ namespace ModemAPI
             // nothing is delivered before OnClientConnected, where the application subscribes to the messages; packets of
             // this session are handled on this same thread, so none of them can be delivered before this line
             prepare.HoldDelivery();
+            // a new stream of the same client is this server's business: it ends this session and opens another one
+            prepare.ReportsForeignStreams = false;
             prepare.RetransmissionsBeforeConsideringRemoteSideDead = 10;
             prepare.OnClose += delegate (SRTPClient sender)
             {

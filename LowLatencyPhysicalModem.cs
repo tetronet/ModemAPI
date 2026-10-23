@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO.Hashing;
 using System.IO.Ports;
 using System.Linq;
@@ -16,7 +17,11 @@ namespace ModemAPI
     {
         private PNetworkCommunicator Communicator;
         private L1Types LevelOneWireType;
-        private long PingInterval;
+        // Modem-KeepAlive: when anything came from the answering modem last (Stopwatch), and the watch of the connection timeout
+        private long LastLineTraffic = Stopwatch.GetTimestamp();
+        private readonly Lock ConnectionWatchLock = new();
+        private Timer? ConnectionWatch;
+        private object? ConnectionWatchRun;
         private List<Action> CRCMismatchEvents = [];
         private PacketQueueAssembler Assembler = new(1000000, 600000000); // 1 million packet queues at the same time, 60 seconds timeout
         private readonly Lock WriterLock = new();
@@ -402,37 +407,82 @@ namespace ModemAPI
                 }
                 InternalErrorHappened(e, ErrorEmitter.LowLatencyPhysicalModem);
             };
+            Communicator.OnDataRead(OnLineData);
         }
-        public void Dial()
+        private void OnLineData(byte[] d, Action k)
         {
-            // attach response handler
-            Communicator.OnDataRead(delegate (byte[] d, Action k)
+            // anything from the answering modem shows the connection is alive, Modem-KeepAlive or any other data
+            Volatile.Write(ref LastLineTraffic, Stopwatch.GetTimestamp());
+            if (d.AsSpan().SequenceEqual(CIoCILLowLatShortDefaultPhrases.KeepAliveRequest))
             {
-                if (IsModemConnected)
+                try
                 {
+                    Communicator.Write(CIoCILLowLatShortDefaultPhrases.KeepAliveResponse);
+                }
+                catch (Exception e)
+                {
+                    InternalErrorHappened(e, ErrorEmitter.LowLatencyPhysicalModem);
+                }
+            }
+        }
+        /// <summary>
+        /// Watches the connection timeout, that the answering modem gave on connecting: when nothing comes from it for so long, the
+        /// connection is considered lost (<see cref="IsModemConnected"/> becomes false), and <see cref="Dial"/> can connect again.
+        /// </summary>
+        private void StartConnectionWatch(ulong timeoutNanoseconds)
+        {
+            lock (ConnectionWatchLock)
+            {
+                ConnectionWatch?.Dispose();
+                ConnectionWatch = null;
+                ConnectionWatchRun = null;
+                Volatile.Write(ref LastLineTraffic, Stopwatch.GetTimestamp());
+                if (timeoutNanoseconds == 0)
+                {
+                    // the answering modem doesn't use Modem-KeepAlive
                     return;
                 }
-                CIoCILLowLatShortResponseBody response = PacketConverter.ParseLowLatencyConnectionResponse(d);
-                if (response.IsResponseDamaged)
+                TimeSpan timeout = TimeSpan.FromTicks((long)Math.Max(1, timeoutNanoseconds / 100));
+                object run = new();
+                ConnectionWatchRun = run;
+                // checked ten times per timeout, but not more often than every 50 ms or less often than every second
+                TimeSpan period = TimeSpan.FromMilliseconds(Math.Clamp(timeout.TotalMilliseconds / 10, 50, 1000));
+                ConnectionWatch = new Timer(state =>
                 {
-                    throw new ConnectionFailedException("damaged response");
-                }
-                if (response.ContainsSMLA)
-                {
-                    LocalModemAddress = Address.Copy(response.PossibleSMLA ?? throw new NullAddressException("no SMLA address found"));
-                }
-                if (response.SpecifiesPacketMTU)
-                {
-                    PacketMTU = response.PossiblePacketMTU ?? throw new NullReferenceException("mtu null");
-                }
-                if (response.SpecifiesLargeMessageMTU)
-                {
-                    LargeMessageMTU = response.PossibleLargeMessageMTU ?? throw new NullReferenceException("mtu null");
-                }
-                PingInterval = (long)(response.PossibleConnectionTimeoutInNanoseconds ?? throw new NullReferenceException("timeout")) / 3;
-                CanExchangeLargeMessages = response.RemoteAddressMachineSupportsLargeMessageOperation;
-                IsModemConnected = true;
-            });
+                    bool lost = false;
+                    lock (ConnectionWatchLock)
+                    {
+                        if (!ReferenceEquals(state, ConnectionWatchRun))
+                        {
+                            return;
+                        }
+                        if (IsModemConnected && Stopwatch.GetElapsedTime(Volatile.Read(ref LastLineTraffic)) <= timeout)
+                        {
+                            return;
+                        }
+                        lost = IsModemConnected;
+                        IsModemConnected = false;
+                        ConnectionWatch?.Dispose();
+                        ConnectionWatch = null;
+                        ConnectionWatchRun = null;
+                    }
+                    if (lost)
+                    {
+                        InternalErrorHappened(new TimeoutException($"nothing came from the answering modem for {timeout}: the connection is considered lost, Dial can connect again"), ErrorEmitter.LowLatencyPhysicalModem);
+                    }
+                }, run, period, period);
+            }
+        }
+        // the handlers of the connection and disconnection responses are attached on the first Dial and Drop, and only once:
+        // Dial is called again after every lost connection
+        private int ConnectionResponseHandlerAttached = 0;
+        private int DisconnectionResponseHandlerAttached = 0;
+        public void Dial()
+        {
+            if (Interlocked.Exchange(ref ConnectionResponseHandlerAttached, 1) == 0)
+            {
+                Communicator.OnDataRead(OnConnectionResponse);
+            }
             // send connection request
             LocalModemAddress ??= new Address();
             LocalModemAddress.AddressValue ??= "0";
@@ -453,16 +503,55 @@ namespace ModemAPI
             Communicator.Write([.. conrequest]);
         }
 
+        private void OnConnectionResponse(byte[] d, Action k)
+        {
+            if (IsModemConnected || !d.AsSpan().StartsWith(CIoCILLowLatShortDefaultPhrases.InitConnectionPrefixResponse))
+            {
+                // connected already, or not a connection response (for example late data of a connection, that is lost)
+                return;
+            }
+            CIoCILLowLatShortResponseBody response = PacketConverter.ParseLowLatencyConnectionResponse(d);
+            // the values of the flags set are there in every response, that isn't damaged
+            if (response.IsResponseDamaged
+                || (response.ContainsSMLA && response.PossibleSMLA == null)
+                || (response.SpecifiesPacketMTU && response.PossiblePacketMTU == null)
+                || (response.SpecifiesLargeMessageMTU && response.PossibleLargeMessageMTU == null))
+            {
+                // the modem stays disconnected; the application learns why, and can Dial again
+                InternalErrorHappened(new ConnectionFailedException("the connection response of the answering modem is damaged"), ErrorEmitter.LowLatencyPhysicalModem);
+                return;
+            }
+            if (response.ContainsSMLA)
+            {
+                LocalModemAddress = Address.Copy(response.PossibleSMLA!);
+            }
+            if (response.SpecifiesPacketMTU)
+            {
+                PacketMTU = response.PossiblePacketMTU!.Value;
+            }
+            if (response.SpecifiesLargeMessageMTU)
+            {
+                LargeMessageMTU = response.PossibleLargeMessageMTU!.Value;
+            }
+            // the timeout is optional (flag 0b00100000): without it the answering modem doesn't use Modem-KeepAlive
+            ulong connectionTimeout = response.SpecifiesConnectionTimeoutInNanoseconds ? response.PossibleConnectionTimeoutInNanoseconds ?? 0 : 0;
+            CanExchangeLargeMessages = response.RemoteAddressMachineSupportsLargeMessageOperation;
+            IsModemConnected = true;
+            StartConnectionWatch(connectionTimeout);
+        }
+
         public void Drop(bool carefulMode)
         {
-            // attach response handler
-            Communicator.OnDataRead(delegate (byte[] d, Action k)
+            if (Interlocked.Exchange(ref DisconnectionResponseHandlerAttached, 1) == 0)
             {
-                if (d.SequenceEqual(CIoCILLowLatShortDefaultPhrases.DisconnectionResponse))
+                Communicator.OnDataRead(delegate (byte[] d, Action k)
                 {
-                    IsModemConnected = false;
-                }
-            });
+                    if (d.SequenceEqual(CIoCILLowLatShortDefaultPhrases.DisconnectionResponse))
+                    {
+                        IsModemConnected = false;
+                    }
+                });
+            }
             // send the request
             Communicator.Write(CIoCILLowLatShortDefaultPhrases.DisconnectionRequest);
         }

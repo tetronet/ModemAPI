@@ -4,3 +4,5 @@
 /.git/
 Tests/**/bin/
 Tests/**/obj/
+CLAUDE.md
+CODE_REVIEW.md

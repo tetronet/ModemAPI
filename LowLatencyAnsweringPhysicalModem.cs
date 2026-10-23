@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Collections.Generic;
 using System.IO.Hashing;
 using System.IO.Ports;
@@ -25,11 +26,36 @@ namespace ModemAPI
         public bool HasPendingConnection = false;
         public bool HasActiveConnection = false;
         private CIoCILLowLatShortConnectionRequestBody PendingConnectionInformation;
+        /// <summary>
+        /// How long a connection request, that waits for <see cref="Answer"/>, keeps the line: until then a connection request from
+        /// another address can't take it (over UDP). Default 10 seconds.
+        /// </summary>
+        public TimeSpan PendingConnectionTimeout { get; set; } = TimeSpan.FromSeconds(10);
+        // when the pending connection request came (Stopwatch)
+        private long PendingConnectionSince;
         private List<Action> EventsForIncomingConnection = [];
         private List<Action> EventsForAnsweredConnection = [];
         private Func<string, Address>? SMLARequest;
         private Address ClientAddress = new();
-        private ulong TimeoutNs = 0;
+        /// <summary>
+        /// Connection timeout in nanoseconds, that this modem tells its subscriber when it connects (LL-CIoCIL-mini). This modem
+        /// sends Modem-KeepAlive every third of it; the subscriber considers the connection lost, when nothing comes for the whole
+        /// timeout. Default is 100 seconds; 0 turns Modem-KeepAlive off on both sides. Used for the next connection.
+        /// </summary>
+        public ulong KeepAliveTimeoutNanoseconds { get; set; } = 100_000_000_000;
+        /// <summary>
+        /// How many Modem-KeepAlives in a row may go without any answer from the subscriber, before the connection is considered
+        /// lost and this modem is ready for a new connection (the subscriber isn't told). Unanswered ones in between answered ones
+        /// don't count. At least 1, default 3.
+        /// </summary>
+        public int MaxMissedKeepAlives { get; set; } = 3;
+        private readonly Lock KeepAliveLock = new();
+        private Timer? KeepAliveTimer;
+        // the Modem-KeepAlive run of the current connection: a tick of an older one does nothing
+        private object? KeepAliveRun;
+        private volatile bool TrafficSinceKeepAlive = false;
+        private bool KeepAliveOutstanding = false;
+        private int MissedKeepAlives = 0;
         private List<Action> CRCMismatchEvents = [];
         private readonly Channel<Packet> TransmissionQueue =
             Channel.CreateBounded<Packet>(new BoundedChannelOptions(1024)
@@ -63,6 +89,7 @@ namespace ModemAPI
         public event Action<L1DropBytesReasons, int> L1DroppedData = delegate { };
         private class PNetworkCommunicator
         {
+            // LEGACY (TCP): see the L1_INET_TCP branch of the constructor
             private TcpListener? tcp;
             private TcpClient? session;
             private UdpClient? udp;
@@ -182,8 +209,11 @@ namespace ModemAPI
                         ErrorReported(e);
                         continue;
                     }
-                    // the line belongs to one subscriber: anybody can send a datagram to this port (with any source address), so only
-                    // a valid connection request, while there is no connection, may make another address the one answered
+                    // the line belongs to one subscriber: anybody can send a datagram to this port (with any source address, the same
+                    // IP address as the subscriber's too: it can be forged, or be a NAT shared by many), so another address becomes
+                    // the one answered only by a valid connection request while there is no connection. A subscriber, that comes
+                    // back from another port (a restart, or NAT gave it a new one), connects as soon as Modem-KeepAlive finds the old
+                    // connection dead; from its own address and port it reconnects right away
                     if (!ep!.Equals(UdpPeer))
                     {
                         if (!CanTakeNewSubscriber() || PacketConverter.ParseLowLatencyConnectionRequest(datagram).IsRequestDamaged)
@@ -226,6 +256,14 @@ namespace ModemAPI
             /// </summary>
             /// <param name="data">Data for sending.</param>
             public void Write(byte[] data)
+            {
+                lock (WriteLock)
+                {
+                    WriteUnlocked(data);
+                }
+            }
+            private readonly Lock WriteLock = new();
+            private void WriteUnlocked(byte[] data)
             {
                 if (t == L1Types.L1_SERIAL)
                 {
@@ -323,6 +361,10 @@ namespace ModemAPI
             }
             else if (wt == L1Types.L1_INET_TCP)
             {
+                // LEGACY, not used: the answering side over TCP is VirtualModem.CreateSlave(Stream, string), one modem per accepted
+                // connection (the application accepts them with its own TcpListener). This listener serves one subscriber, and
+                // every new TCP connection replaces it; don't let user code reach this branch (the constructor is internal, and
+                // CreateSlave(string, int, L1Types, bool) refuses TCP). Kept for now, not to be fixed or extended.
                 Communicator = new(new(IPAddress.Parse(wire.Split(':')[0]), int.Parse(wire.Split(':')[1])), null, null);
             }
             else if (wt == L1Types.L1_INET_UDP)
@@ -343,20 +385,27 @@ namespace ModemAPI
             }
             Communicator.Init(wt);
             Communicator.ErrorReported = delegate (Exception e) { InternalErrorHappened(e, ErrorEmitter.LowLatencyAnsweringPhysicalModem); };
-            Communicator.CanTakeNewSubscriber = delegate () { return !HasActiveConnection; };
+            Communicator.CanTakeNewSubscriber = CanTakeNewSubscriber;
             Communicator.OnDataRead(delegate (byte[] d, Action k)
             {
-                if (!HasActiveConnection)
+                // anything from the subscriber shows it is alive, the answer to Modem-KeepAlive or any other data
+                TrafficSinceKeepAlive = true;
+            });
+            Communicator.OnDataRead(delegate (byte[] d, Action k)
+            {
+                // a connection request is answered even during an active connection: the subscriber only asks again when it lost
+                // the connection without saying so (it crashed, or its network changed), and otherwise it couldn't connect anymore.
+                // Only the subscriber's own line can deliver it: the current TCP session, or UDP from its own address and port.
+                CIoCILLowLatShortConnectionRequestBody temp = PacketConverter.ParseLowLatencyConnectionRequest(d);
+                if (!temp.IsRequestDamaged)
                 {
-                    CIoCILLowLatShortConnectionRequestBody temp = PacketConverter.ParseLowLatencyConnectionRequest(d);
-                    if (!temp.IsRequestDamaged)
+                    HasActiveConnection = false;
+                    Volatile.Write(ref PendingConnectionSince, Stopwatch.GetTimestamp());
+                    HasPendingConnection = true;
+                    PendingConnectionInformation = temp;
+                    foreach (Action action in EventsForIncomingConnection)
                     {
-                        HasPendingConnection = true;
-                        PendingConnectionInformation = temp;
-                        foreach (Action action in EventsForIncomingConnection)
-                        {
-                            action();
-                        }
+                        action();
                     }
                 }
             });
@@ -382,20 +431,27 @@ namespace ModemAPI
             Communicator = new(null, null, mssp);
             Communicator.Init(L1Types.L1_SERIAL);
             Communicator.ErrorReported = delegate (Exception e) { InternalErrorHappened(e, ErrorEmitter.LowLatencyAnsweringPhysicalModem); };
-            Communicator.CanTakeNewSubscriber = delegate () { return !HasActiveConnection; };
+            Communicator.CanTakeNewSubscriber = CanTakeNewSubscriber;
             Communicator.OnDataRead(delegate (byte[] d, Action k)
             {
-                if (!HasActiveConnection)
+                // anything from the subscriber shows it is alive, the answer to Modem-KeepAlive or any other data
+                TrafficSinceKeepAlive = true;
+            });
+            Communicator.OnDataRead(delegate (byte[] d, Action k)
+            {
+                // a connection request is answered even during an active connection: the subscriber only asks again when it lost
+                // the connection without saying so (it crashed, or its network changed), and otherwise it couldn't connect anymore.
+                // Only the subscriber's own line can deliver it: the current TCP session, or UDP from its own address and port.
+                CIoCILLowLatShortConnectionRequestBody temp = PacketConverter.ParseLowLatencyConnectionRequest(d);
+                if (!temp.IsRequestDamaged)
                 {
-                    CIoCILLowLatShortConnectionRequestBody temp = PacketConverter.ParseLowLatencyConnectionRequest(d);
-                    if (!temp.IsRequestDamaged)
+                    HasActiveConnection = false;
+                    Volatile.Write(ref PendingConnectionSince, Stopwatch.GetTimestamp());
+                    HasPendingConnection = true;
+                    PendingConnectionInformation = temp;
+                    foreach (Action action in EventsForIncomingConnection)
                     {
-                        HasPendingConnection = true;
-                        PendingConnectionInformation = temp;
-                        foreach (Action action in EventsForIncomingConnection)
-                        {
-                            action();
-                        }
+                        action();
                     }
                 }
             });
@@ -416,6 +472,12 @@ namespace ModemAPI
             LargeMessageMaximumTransmissionUnit = lmmtu;
             AllowLargeMessageOperations = allowlm;
             ModemName = modemName;
+        }
+        // another subscriber may take the line only when it is free: no active connection, and no connection request waiting for
+        // Answer() (unless it waits for longer than PendingConnectionTimeout: the application doesn't answer it)
+        private bool CanTakeNewSubscriber()
+        {
+            return !HasActiveConnection && (!HasPendingConnection || Stopwatch.GetElapsedTime(Volatile.Read(ref PendingConnectionSince)) > PendingConnectionTimeout);
         }
         public void Answer()
         {
@@ -452,7 +514,8 @@ namespace ModemAPI
                 Span<byte> crc32 = stackalloc byte[4];
                 BinaryPrimitives.WriteUInt16BigEndian(mtuForPacketsBytes, (ushort)PacketMaximumTransmissionUnit);
                 BinaryPrimitives.WriteUInt64BigEndian(mtuForLargeMessagesBytes, LargeMessageMaximumTransmissionUnit);
-                BinaryPrimitives.WriteUInt64BigEndian(keepaliveTimeoutInNanosecondsBytes, TimeoutNs);
+                ulong keepAliveTimeout = KeepAliveTimeoutNanoseconds;
+                BinaryPrimitives.WriteUInt64BigEndian(keepaliveTimeoutInNanosecondsBytes, keepAliveTimeout);
                 response.AddRange(mtuForPacketsBytes);
                 response.AddRange(mtuForLargeMessagesBytes);
                 response.AddRange(keepaliveTimeoutInNanosecondsBytes);
@@ -460,11 +523,83 @@ namespace ModemAPI
                 response.AddRange(crc32);
                 Communicator.Write([.. response]);
                 HasActiveConnection = true;
+                StartKeepAlive(keepAliveTimeout);
             }
             else
             {
                 throw new InvalidOperationException("no pending connections for answering");
             }
+        }
+
+        private void StartKeepAlive(ulong timeoutNanoseconds)
+        {
+            lock (KeepAliveLock)
+            {
+                KeepAliveTimer?.Dispose();
+                KeepAliveTimer = null;
+                KeepAliveRun = null;
+                if (timeoutNanoseconds == 0)
+                {
+                    return;
+                }
+                object run = new();
+                KeepAliveRun = run;
+                TrafficSinceKeepAlive = false;
+                KeepAliveOutstanding = false;
+                MissedKeepAlives = 0;
+                // every third of the timeout (nanoseconds / 100 = ticks)
+                TimeSpan interval = TimeSpan.FromTicks((long)Math.Max(1, timeoutNanoseconds / 3 / 100));
+                KeepAliveTimer = new Timer(KeepAliveTick, run, interval, interval);
+            }
+        }
+        private void KeepAliveTick(object? run)
+        {
+            lock (KeepAliveLock)
+            {
+                if (!ReferenceEquals(run, KeepAliveRun))
+                {
+                    return;
+                }
+                if (!HasActiveConnection)
+                {
+                    // disconnected or connecting again: this run is over
+                    StopKeepAlive();
+                    return;
+                }
+                if (KeepAliveOutstanding)
+                {
+                    // the previous Modem-KeepAlive counts as answered, if anything came from the subscriber since it was sent
+                    if (TrafficSinceKeepAlive)
+                    {
+                        MissedKeepAlives = 0;
+                    }
+                    else if (++MissedKeepAlives >= Math.Max(1, MaxMissedKeepAlives))
+                    {
+                        // the connection is dead: ready for a new one; the subscriber isn't told, and no more Modem-KeepAlives are sent
+                        HasActiveConnection = false;
+                        HasPendingConnection = false;
+                        StopKeepAlive();
+                        return;
+                    }
+                }
+                TrafficSinceKeepAlive = false;
+                KeepAliveOutstanding = true;
+            }
+            try
+            {
+                Communicator.Write(CIoCILLowLatShortDefaultPhrases.KeepAliveRequest);
+            }
+            catch (Exception e)
+            {
+                InternalErrorHappened(e, ErrorEmitter.LowLatencyAnsweringPhysicalModem);
+            }
+        }
+        // must be called under KeepAliveLock
+        private void StopKeepAlive()
+        {
+            KeepAliveTimer?.Dispose();
+            KeepAliveTimer = null;
+            KeepAliveRun = null;
         }
 
         public void AttachConnectEvent(Action onConnection)
