@@ -3,6 +3,7 @@ using System.Buffers;
 using System.IO.Hashing;
 using System.IO.Ports;
 using System.Net.WebSockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 
@@ -16,6 +17,12 @@ namespace ModemAPI
         private string DeleteLargeMessages = "";
         private SocketIO? TransmitterDevice = null;
         private ClientWebSocket? RawTransmitterDevice = null;
+        // RAWWS: a WebSocket takes one send at a time, and the message of a packet is written into a buffer reused under this lock
+        private readonly SemaphoreSlim RawSendLock = new(1, 1);
+        private readonly RawWsCodec RawSendCodec = new();
+        // RAWWS: one reconnection at a time, shared by the receive loop and every sender
+        private readonly Lock ReconnectLock = new();
+        private Task? ReconnectTask = null;
         private object PacketBufferLock = new object();
         private SortedDictionary<ulong, SortedDictionary<ulong, Packet>> PacketBuffer = new SortedDictionary<ulong, SortedDictionary<ulong, Packet>>();
         private event Action<Packet, Action> InternalPacketEvents = delegate { };
@@ -555,7 +562,7 @@ namespace ModemAPI
                         //Console.WriteLine("tx or rx null");
                         return;
                     }
-                    if (receiverAddress.StartsWith(LocalModemAddress.AddressValue) && !transmitterAddress.StartsWith(LocalModemAddress.AddressValue))
+                    if (IsWithin(receiverAddress, LocalModemAddress.AddressValue) && !IsWithin(transmitterAddress, LocalModemAddress.AddressValue))
                     {
                         //Console.WriteLine("actually working");
                         InternalPacketEvents(receivedPacket, delegate () { throw new NotImplementedException("was unable to remove the event"); });
@@ -581,36 +588,82 @@ namespace ModemAPI
                 }
                 Task.Run(async delegate ()
                 {
+                    ClientWebSocket firstSocket = RawTransmitterDevice;
                     try
                     {
-                        await RawTransmitterDevice.ConnectAsync(new Uri(Cias), default);
+                        await firstSocket.ConnectAsync(new Uri(Cias), default);
                     }
                     catch
                     {
-                        await ReconnectAsync();
+                        await ReconnectAsync(firstSocket);
                     }
                     byte[] webSocketReceiveBuffer = new byte[500000];
+                    RawWsCodec receiveCodec = new();
                     while (true)
                     {
                         try
                         {
-                            WebSocketReceiveResult rslt;
-                            try
+                            // a message can come in several parts: it is read whole; a message longer than the buffer is dropped
+                            int count = 0;
+                            bool tooLong = false;
+                            bool reconnect = false;
+                            // the socket this message is read from: a failure of it, not of a newer one, starts a reconnection
+                            ClientWebSocket socket = RawTransmitterDevice;
+                            while (true)
                             {
-                                rslt = await RawTransmitterDevice.ReceiveAsync(webSocketReceiveBuffer, default);
+                                ValueWebSocketReceiveResult rslt;
+                                try
+                                {
+                                    Memory<byte> free = tooLong ? webSocketReceiveBuffer : webSocketReceiveBuffer.AsMemory(count);
+                                    rslt = await socket.ReceiveAsync(free, default);
+                                }
+                                catch
+                                {
+                                    reconnect = true;
+                                    break;
+                                }
+                                if (rslt.MessageType == WebSocketMessageType.Close) // connection closed
+                                {
+                                    reconnect = true;
+                                    break;
+                                }
+                                if (!tooLong)
+                                {
+                                    count += rslt.Count;
+                                }
+                                if (rslt.EndOfMessage)
+                                {
+                                    break;
+                                }
+                                if (count == webSocketReceiveBuffer.Length)
+                                {
+                                    tooLong = true;
+                                }
                             }
-                            catch
+                            if (reconnect)
                             {
-                                await ReconnectAsync();
+                                await ReconnectAsync(socket);
                                 continue;
                             }
-                            if (rslt.MessageType == WebSocketMessageType.Close) // connection closed
+                            if (tooLong)
                             {
-                                await ReconnectAsync();
                                 continue;
                             }
-                            Span<byte> message = webSocketReceiveBuffer.AsSpan(0, rslt.Count);
-                            string textMessage = Encoding.ASCII.GetString(message);
+                            ReadOnlyMemory<byte> message = webSocketReceiveBuffer.AsMemory(0, count);
+                            if (RawWsCodec.IsDataTransmission(message.Span))
+                            {
+                                // the usual packet: read straight from the bytes; any other shape is read below, the old way
+                                if (LocalModemAddress == null || LocalModemAddress.AddressValue == null)
+                                {
+                                    continue;
+                                }
+                                if (receiveCodec.TryReadDataTransmission(message.Span, out Packet? fastPacket))
+                                {
+                                    DeliverRawPacket(fastPacket!);
+                                    continue;
+                                }
+                            }
+                            string textMessage = Encoding.ASCII.GetString(message.Span);
                             int eventNameStart = textMessage.IndexOf('"');
                             int eventNameEnd = textMessage.IndexOf('"', eventNameStart + 1);
                             string eventName = textMessage[(eventNameStart + 1)..eventNameEnd].Trim();
@@ -618,7 +671,7 @@ namespace ModemAPI
                             switch (eventName)
                             {
                                 case "get-addr":
-                                    await RawTransmitterDevice.SendAsync(Encoding.ASCII.GetBytes($"[\"self-addr\",\"{localModemAddressString}\"]"), WebSocketMessageType.Text, true, default);
+                                    await RawSendAsync(Encoding.ASCII.GetBytes($"[\"self-addr\",\"{localModemAddressString}\"]"));
                                     break;
                                 case "set-modem-local-address":
                                     List<JsonElement>? stringsSmla = JsonSerializer.Deserialize<List<JsonElement>>(textMessage) ?? throw new ConnectionFailedException("during SMLA there was no JSON data");
@@ -631,7 +684,7 @@ namespace ModemAPI
                                     AddressWasSetByUpperNode = false;
                                     break;
                                 case "get-device-type":
-                                    await RawTransmitterDevice.SendAsync(Encoding.ASCII.GetBytes($"[\"device-type\",\"{(ConnectAsAnAddressMachine ? "address-machine" : "modem")}\"]"), WebSocketMessageType.Text, true, default);
+                                    await RawSendAsync(Encoding.ASCII.GetBytes($"[\"device-type\",\"{(ConnectAsAnAddressMachine ? "address-machine" : "modem")}\"]"));
                                     InternalModemConnected = true;
                                     break;
                                 case "data-transmission":
@@ -649,26 +702,7 @@ namespace ModemAPI
                                         break;
                                     }
                                     Packet receivedPacket = PacketConverter.WebSocketMessageToPacket(receivedMessage);
-                                    ModemAPIDebugger.OutputDebugMessage(receivedPacket.Receiver.AddressValue ?? "virtmodem no receiver");
-                                    ModemAPIDebugger.OutputDebugMessage(receivedPacket.Transmitter.AddressValue ?? "virtmodem no transmitter");
-                                    if (receivedPacket.IsErrorWhileReading == true)
-                                    {
-                                        ModemAPIDebugger.OutputDebugMessage("error while receiving packet");
-                                        break;
-                                    }
-                                    string? receiverAddress = receivedPacket.Receiver.AddressValue;
-                                    string? transmitterAddress = receivedPacket.Transmitter.AddressValue;
-                                    if (receiverAddress == null || transmitterAddress == null)
-                                    {
-                                        //Console.WriteLine("tx or rx null");
-                                        break;
-                                    }
-                                    if (receiverAddress.StartsWith(LocalModemAddress.AddressValue) && !transmitterAddress.StartsWith(LocalModemAddress.AddressValue))
-                                    {
-                                        //Console.WriteLine("actually working");
-                                        InternalPacketEvents(receivedPacket, delegate () { throw new NotImplementedException("was unable to remove the event"); });
-                                        GenericPacketCounter++;
-                                    }
+                                    DeliverRawPacket(receivedPacket);
                                     break;
                             }
                         }
@@ -680,6 +714,54 @@ namespace ModemAPI
                 });
             }
         }
+        /// <summary>
+        /// Hands a packet, that came over RAWWS, to the subscribers, if it is for this modem and not from it.
+        /// </summary>
+        private void DeliverRawPacket(Packet receivedPacket)
+        {
+            ModemAPIDebugger.OutputDebugMessage(receivedPacket.Receiver.AddressValue ?? "virtmodem no receiver");
+            ModemAPIDebugger.OutputDebugMessage(receivedPacket.Transmitter.AddressValue ?? "virtmodem no transmitter");
+            if (receivedPacket.IsErrorWhileReading == true)
+            {
+                ModemAPIDebugger.OutputDebugMessage("error while receiving packet");
+                return;
+            }
+            string? localAddress = LocalModemAddress?.AddressValue;
+            string? receiverAddress = receivedPacket.Receiver.AddressValue;
+            string? transmitterAddress = receivedPacket.Transmitter.AddressValue;
+            if (localAddress == null || receiverAddress == null || transmitterAddress == null)
+            {
+                return;
+            }
+            if (IsWithin(receiverAddress, localAddress) && !IsWithin(transmitterAddress, localAddress))
+            {
+                InternalPacketEvents(receivedPacket, delegate () { throw new NotImplementedException("was unable to remove the event"); });
+                GenericPacketCounter++;
+            }
+        }
+
+        /// <summary>
+        /// Whether the address is the local one or one under it: 7-1-1 and 7-1-1-5 are within 7-1-1, but 7-1-12 isn't.
+        /// Addresses are digits and dashes: compared ordinally, not by the rules of the current culture.
+        /// </summary>
+        private static bool IsWithin(string address, string local)
+        {
+            return address.StartsWith(local, StringComparison.Ordinal) && (address.Length == local.Length || address[local.Length] == '-');
+        }
+
+        private async Task RawSendAsync(byte[] message)
+        {
+            await RawSendLock.WaitAsync();
+            try
+            {
+                await RawTransmitterDevice!.SendAsync(message, WebSocketMessageType.Text, true, default);
+            }
+            finally
+            {
+                RawSendLock.Release();
+            }
+        }
+
         /// <summary>
         /// Disconnects this modem from the tetronet.
         /// </summary>
@@ -820,18 +902,26 @@ namespace ModemAPI
                 {
                     throw new InvalidOperationException("transmitter device null");
                 }
-                byte[] payload = JsonSerializer.SerializeToUtf8Bytes(new object[] { "data-transmission", PacketConverter.PacketToWebSocketMessage(packet) });
+                RawSendLock.Wait();
                 try
                 {
-                    RawTransmitterDevice.SendAsync(payload, WebSocketMessageType.Text, true, default).Wait();
+                    // the same bytes as JsonSerializer.SerializeToUtf8Bytes(new object[] { "data-transmission", PacketToWebSocketMessage(packet) })
+                    MemoryMarshal.TryGetArray(RawSendCodec.WriteDataTransmission(packet), out ArraySegment<byte> payload);
+                    ClientWebSocket socket = RawTransmitterDevice;
+                    try
+                    {
+                        // GetResult, not Wait: the exception of the send itself is caught, not an AggregateException around it
+                        socket.SendAsync(payload, WebSocketMessageType.Text, true, default).GetAwaiter().GetResult();
+                    }
+                    catch (Exception e) when (e is WebSocketException or OperationCanceledException or InvalidOperationException or ObjectDisposedException)
+                    {
+                        // the connection is lost: the packet is lost with it, as on any line
+                        ReconnectAsync(socket).GetAwaiter().GetResult();
+                    }
                 }
-                catch (OperationCanceledException)
+                finally
                 {
-                    ReconnectAsync().Wait();
-                }
-                catch (InvalidOperationException)
-                {
-                    ReconnectAsync().Wait();
+                    RawSendLock.Release();
                 }
             }
             GenericPacketCounter++;
@@ -1102,22 +1192,51 @@ namespace ModemAPI
             AddressPortPairs.TryAdd(result.ToString(), modemName);
             return result;
         }
-        private async Task ReconnectAsync()
+        /// <summary>
+        /// Replaces the failed RAWWS socket with a new connection. Whoever notices the failure first starts the reconnection,
+        /// the others wait for the same one; a socket that was already replaced needs nothing.
+        /// </summary>
+        /// <param name="failed">The socket, a send or receive on which failed</param>
+        private Task ReconnectAsync(ClientWebSocket failed)
+        {
+            lock (ReconnectLock)
+            {
+                if (!ReferenceEquals(RawTransmitterDevice, failed))
+                {
+                    return Task.CompletedTask;
+                }
+                if (ReconnectTask == null || ReconnectTask.IsCompleted)
+                {
+                    ReconnectTask = Task.Run(() => ReconnectLoopAsync(failed));
+                }
+                return ReconnectTask;
+            }
+        }
+
+        private async Task ReconnectLoopAsync(ClientWebSocket failed)
         {
             InternalModemConnected = false;
+            // the old connection is closed, so the server doesn't see this modem twice, and a send or receive still on it ends
+            failed.Abort();
+            failed.Dispose();
             while (true)
             {
+                ClientWebSocket fresh = new();
                 try
                 {
                     OnReconnectWebsocket();
-                    RawTransmitterDevice = new ClientWebSocket();
-                    await RawTransmitterDevice.ConnectAsync(new Uri(Cias), default);
+                    await fresh.ConnectAsync(new Uri(Cias), default);
+                    lock (ReconnectLock)
+                    {
+                        RawTransmitterDevice = fresh;
+                    }
                     InternalModemConnected = true;
                     OnSuccessReconnectWebsocket();
                     return;
                 }
                 catch
                 {
+                    fresh.Dispose();
                     await Task.Delay(2000);
                 }
             }

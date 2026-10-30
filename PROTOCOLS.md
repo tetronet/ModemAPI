@@ -133,7 +133,8 @@ A reliable, ordered stream of messages between two tetronet addresses. There's n
 * The receiver acknowledges every message, the repeated ones too (the previous acknowledgement could have been lost)
 * The receiver delivers messages to the application in the order of their sequential numbers
 * Messages more than 1024 (MaxPacketNoFromFuture) numbers ahead of the last delivered one are dropped without an acknowledgement
-* The sender retransmits a message, that wasn't acknowledged in time (the timeout is set by the application), and considers the remote side dead after 100 (RetransmissionsBeforeConsideringRemoteSideDead) retransmissions of one message
+* The sender retransmits a message, that wasn't acknowledged in time, and considers the remote side dead after 100 (RetransmissionsBeforeConsideringRemoteSideDead) retransmissions of one message
+* The time to wait is measured from the round trip, as RFC 6298: SRTT + 4·RTTVAR, from acknowledgements of messages sent once (Karn's algorithm). It is never shorter than the timeout set by the application and not longer than 60 s (unless the application's timeout is longer). Every retransmission by timeout doubles the wait, up to 8 times: of that message, and of all messages till the next round trip is measured
 ```
 ##### v2: batched and selective acknowledgements
 ```

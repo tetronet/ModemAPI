@@ -55,6 +55,17 @@ namespace ModemAPI
         private volatile bool IsClosed = false;
         private int CloseStarted = 0;
         private int TicksTimeout;
+        // retransmission timeout from the measured round trip, as RFC 6298, but never shorter than TicksTimeout; changed under AcknowledgementLock
+        private long SmoothedRttTicks = -1;
+        private long RttVarianceTicks = 0;
+        private long RetransmissionTimeoutTicks;
+        private static readonly long MaxRetransmissionTimeoutTicks = TimeSpan.FromSeconds(60).Ticks;
+        // every timeout doubles the wait, up to 2^3 = 8 retransmission timeouts: of the packet itself, and of every packet till
+        // the next round trip is measured (RFC 6298, 5.5), otherwise with the round trip longer than the timeout every packet
+        // would be retransmitted before its acknowledgement and none would give a sample
+        private const int MaxBackoffDoublings = 3;
+        private int BackoffDoublings = 0;
+        private long LastBackoffTimestamp = 0;
         private ConcurrentDictionary<long, byte[]> ReorderingBuffer = new ConcurrentDictionary<long, byte[]>();
         private ConcurrentDictionary<long, ReliablePacketInformation> InternalState = new ConcurrentDictionary<long, ReliablePacketInformation>();
         private readonly Lock ReceiveLock = new();
@@ -159,6 +170,7 @@ namespace ModemAPI
         public int TransmitTimeOutInTicks = 600000000;
         /// <summary>
         /// How many retransmissions will any of the packets need to cause the remote side being considered dead and when Transmit(byte[]) method will throw an exception.
+        /// The wait before every next retransmission of the same packet doubles, up to 8 retransmission timeouts.
         /// </summary>
         public int RetransmissionsBeforeConsideringRemoteSideDead = 100;
         /// <summary>
@@ -196,6 +208,7 @@ namespace ModemAPI
             Modem = modem;
             CommunicatingWith = dst;
             TicksTimeout = tickTimeout;
+            RetransmissionTimeoutTicks = tickTimeout;
             // receiver task
             Modem.AttachReceiveEventNoUnfragment(OnPacketReceived);
             // error correction task, also cleans the reordering buffer once a second
@@ -206,9 +219,11 @@ namespace ModemAPI
                 {
                     try
                     {
+                        long timeout = Volatile.Read(ref RetransmissionTimeoutTicks);
+                        int backoff = Volatile.Read(ref BackoffDoublings);
                         foreach (ReliablePacketInformation info in InternalState.Values)
                         {
-                            if (info.CheckTimeout(TicksTimeout))
+                            if (info.CheckTimeout(timeout << Math.Min(Math.Max(backoff, info.RetransmissionCounter), MaxBackoffDoublings)))
                             {
                                 // a packet gets exactly RetransmissionsBeforeConsideringRemoteSideDead retransmissions
                                 if (info.RetransmissionCounter >= RetransmissionsBeforeConsideringRemoteSideDead)
@@ -218,6 +233,7 @@ namespace ModemAPI
                                     break;
                                 }
                                 info.RetransmissionCounter++;
+                                BackOff(timeout << backoff);
                                 // retransmit packets
                                 UnivSend(info.Data, StreamDataTag);
                                 // update timeout
@@ -362,11 +378,16 @@ namespace ModemAPI
                 if (dataReceived.Length == 8)
                 {
                     // == ack receiver ==
-                    if (InternalState.TryRemove(id, out _))
+                    if (InternalState.TryRemove(id, out ReliablePacketInformation? acknowledgedInfo))
                     {
                         OnAckReceived(id);
                         lock (AcknowledgementLock)
                         {
+                            long roundTrip = RoundTripOf(acknowledgedInfo);
+                            if (roundTrip >= 0)
+                            {
+                                SampleRoundTrip(roundTrip);
+                            }
                             AdvanceLowestUnacknowledged();
                         }
                         AcknowledgementsReceived(1);
@@ -477,13 +498,16 @@ namespace ModemAPI
             List<ReliablePacketInformation>? lost = null;
             lock (AcknowledgementLock)
             {
+                // one sample per acknowledgement: the packet sent last, it waited the least for the acknowledgement to be sent
+                long roundTrip = long.MaxValue;
                 long upTo = Math.Min(cumulative, Interlocked.Read(ref SequentialPacketNumber) - 1);
                 for (long id = LowestUnacknowledged; id <= upTo; id++)
                 {
-                    if (InternalState.TryRemove(id, out _))
+                    if (InternalState.TryRemove(id, out ReliablePacketInformation? info))
                     {
                         acknowledged++;
                         OnAckReceived(id);
+                        roundTrip = MinRoundTrip(roundTrip, info);
                     }
                 }
                 if (upTo >= LowestUnacknowledged)
@@ -492,11 +516,16 @@ namespace ModemAPI
                 }
                 for (int bit = 0; bit < Math.Min((acknowledgement.Length - 8) * 8, SelectiveAckBits); bit++)
                 {
-                    if ((acknowledgement[8 + bit / 8] & (1 << (bit % 8))) != 0 && InternalState.TryRemove(cumulative + 1 + bit, out _))
+                    if ((acknowledgement[8 + bit / 8] & (1 << (bit % 8))) != 0 && InternalState.TryRemove(cumulative + 1 + bit, out ReliablePacketInformation? info))
                     {
                         acknowledged++;
                         OnAckReceived(cumulative + 1 + bit);
+                        roundTrip = MinRoundTrip(roundTrip, info);
                     }
+                }
+                if (roundTrip != long.MaxValue)
+                {
+                    SampleRoundTrip(roundTrip);
                 }
                 // the window start doesn't move past selectively acknowledged packets: they are received, but not delivered
                 // yet, and the receiver only takes packets up to its delivered position + MaxPacketNoFromFuture
@@ -516,6 +545,56 @@ namespace ModemAPI
                     OnRetransmit(info.Id);
                 }
                 HalveWindowOnLoss();
+            }
+        }
+        /// <summary>
+        /// Time from the sending of the packet till its acknowledgement, or -1 if it was retransmitted: then it is unknown,
+        /// which of the copies got acknowledged (Karn's algorithm).
+        /// </summary>
+        private static long RoundTripOf(ReliablePacketInformation info)
+        {
+            if (info.RetransmissionCounter > 0 || info.FastRetransmittedBefore >= 0)
+            {
+                return -1;
+            }
+            return Stopwatch.GetElapsedTime(Volatile.Read(ref info.TimeStamp)).Ticks;
+        }
+        private static long MinRoundTrip(long current, ReliablePacketInformation info)
+        {
+            long roundTrip = RoundTripOf(info);
+            return roundTrip >= 0 && roundTrip < current ? roundTrip : current;
+        }
+        /// <summary>
+        /// Updates the retransmission timeout with a measured round trip, as RFC 6298: SRTT + 4·RTTVAR, not shorter than the
+        /// timeout given to the constructor and not longer than 60 s (unless the given timeout is longer).
+        /// Must be called under <see cref="AcknowledgementLock"/>.
+        /// </summary>
+        private void SampleRoundTrip(long roundTrip)
+        {
+            if (SmoothedRttTicks < 0)
+            {
+                SmoothedRttTicks = roundTrip;
+                RttVarianceTicks = roundTrip / 2;
+            }
+            else
+            {
+                RttVarianceTicks = (3 * RttVarianceTicks + Math.Abs(SmoothedRttTicks - roundTrip)) / 4;
+                SmoothedRttTicks = (7 * SmoothedRttTicks + roundTrip) / 8;
+            }
+            long timeout = Math.Clamp(SmoothedRttTicks + 4 * RttVarianceTicks, TicksTimeout, Math.Max(TicksTimeout, MaxRetransmissionTimeoutTicks));
+            Volatile.Write(ref RetransmissionTimeoutTicks, timeout);
+            Volatile.Write(ref BackoffDoublings, 0);
+        }
+        /// <summary>
+        /// Doubles the wait of every packet on a timeout, but not more often than once per the current wait, so packets
+        /// timing out together double it once. Called by the retransmission task only.
+        /// </summary>
+        private void BackOff(long currentTimeout)
+        {
+            if (Volatile.Read(ref BackoffDoublings) < MaxBackoffDoublings && Stopwatch.GetElapsedTime(LastBackoffTimestamp).Ticks > currentTimeout)
+            {
+                Interlocked.Increment(ref BackoffDoublings);
+                LastBackoffTimestamp = Stopwatch.GetTimestamp();
             }
         }
         /// <summary>

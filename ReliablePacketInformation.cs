@@ -43,6 +43,11 @@ namespace ModemAPI
         {
             return Stopwatch.GetElapsedTime(Volatile.Read(ref TimeStamp)).Ticks > timeout;
         }
+        /// <inheritdoc cref="CheckTimeout(int)"/>
+        public bool CheckTimeout(long timeout)
+        {
+            return Stopwatch.GetElapsedTime(Volatile.Read(ref TimeStamp)).Ticks > timeout;
+        }
         public void UpdateTimeStamp()
         {
             Volatile.Write(ref TimeStamp, Stopwatch.GetTimestamp());

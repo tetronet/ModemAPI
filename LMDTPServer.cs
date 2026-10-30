@@ -31,7 +31,6 @@ namespace ModemAPI
         private bool IsListBlackOrWhite;
         private uint ConnectionIDRangeStart;
         private uint ConnectionIDRangeEnd;
-        private int SrtpTimeout = 0;
         private int SrtpRateLimiting = 0;
         private static readonly UTF8Encoding StrictUtf8 = new(false, true);
         /// <summary>
@@ -67,6 +66,19 @@ namespace ModemAPI
         /// </summary>
         public int MaxSessionsPerAddress = 16;
         /// <summary>
+        /// The size of InternalState of the SRTP clients this server creates for its sessions: the transmission window, measured in packets.
+        /// It is how many packets a session may send past the first unacknowledged one before it waits for acknowledgements
+        /// (<see cref="SRTPClient.MaxUnackedPackets"/>). Keep it not bigger than the receive window of the clients
+        /// (<see cref="SRTPClient.MaxPacketNoFromFuture"/>, 1024 by default). Taken by sessions created after the change. At least 1, default 1024.
+        /// </summary>
+        public int SrtpInternalStateMaxSize = 1024;
+        /// <summary>
+        /// How long, in ticks (10 000 000 per second), the SRTP clients this server creates wait for the acknowledgement of a packet
+        /// before retransmitting it: the packet timeout of the sessions. Set by the constructor (srtpTimeoutInTicks).
+        /// Taken by sessions created after the change. More than 0.
+        /// </summary>
+        public int SrtpRetransmissionTimeoutTicks;
+        /// <summary>
         /// Creates a new instance of LMDTPServer.
         /// </summary>
         /// <param name="baseModem">Modem, that will be used by the server to communicate with the Tetronet</param>
@@ -74,6 +86,7 @@ namespace ModemAPI
         /// <param name="connectionIdRangeEnd">End of the Connection ID range, in which this server will listen to the requests</param>
         /// <param name="grayList">List, that can be Black or White list to prevent some people from accessing this server</param>
         /// <param name="blackOrWhiteList">Set it to true if you want to make white list, and false to make black list</param>
+        /// <param name="srtpTimeoutInTicks">Initial value of <see cref="SrtpRetransmissionTimeoutTicks"/></param>
         public LMDTPServer(IModem baseModem, uint connectionIdRangeStart, uint connectionIdRangeEnd, List<Address> grayList, bool blackOrWhiteList, int srtpTimeoutInTicks, int srtpRateLimiting)
         {
             BaseModem = baseModem;
@@ -81,7 +94,7 @@ namespace ModemAPI
             ConnectionIDRangeEnd = connectionIdRangeEnd;
             GrayList = [..grayList];
             IsListBlackOrWhite = blackOrWhiteList;
-            SrtpTimeout = srtpTimeoutInTicks;
+            SrtpRetransmissionTimeoutTicks = srtpTimeoutInTicks;
             SrtpRateLimiting = srtpRateLimiting;
         }
         /// <summary>
@@ -89,7 +102,7 @@ namespace ModemAPI
         /// </summary>
         /// <exception cref="InvalidOperationException">The configuration is invalid: <see cref="ResourceProvider"/> isn't set,
         /// <see cref="PacketMaxLength"/> is not 1 to <see cref="SRTPClient.MaxMessageLength"/>, the ConnectionID range is empty,
-        /// the SRTP timeout is not positive or the SRTP rate limiting is negative</exception>
+        /// the SRTP timeout is not positive, <see cref="SrtpInternalStateMaxSize"/> is less than 1 or the SRTP rate limiting is negative</exception>
         public void Start()
         {
             // the configuration is checked once here, instead of failing in the middle of the first transfer
@@ -105,9 +118,13 @@ namespace ModemAPI
             {
                 throw new InvalidOperationException($"the ConnectionID range {ConnectionIDRangeStart}-{ConnectionIDRangeEnd} is empty");
             }
-            if (SrtpTimeout <= 0)
+            if (SrtpRetransmissionTimeoutTicks <= 0)
             {
-                throw new InvalidOperationException($"the SRTP timeout must be more than 0 ticks, but it is {SrtpTimeout}");
+                throw new InvalidOperationException($"the SRTP timeout must be more than 0 ticks, but it is {SrtpRetransmissionTimeoutTicks}");
+            }
+            if (SrtpInternalStateMaxSize < 1)
+            {
+                throw new InvalidOperationException($"SrtpInternalStateMaxSize must be at least 1 packet, but it is {SrtpInternalStateMaxSize}");
             }
             if (SrtpRateLimiting < 0)
             {
@@ -194,7 +211,8 @@ namespace ModemAPI
                         return;
                     }
                 }
-                SRTPClient session = new(BaseModem, p.Transmitter, "lm_tunnel", p.ConnectionID, SrtpTimeout);
+                SRTPClient session = new(BaseModem, p.Transmitter, "lm_tunnel", p.ConnectionID, SrtpRetransmissionTimeoutTicks);
+                session.MaxUnackedPackets = SrtpInternalStateMaxSize;
                 session.PacketLossBasedCongestionControl = SrtpEnablePacketLossBasedRateLimiter;
                 session.TicksPacketDelay = SrtpRateLimiting;
                 session.RetransmissionsBeforeConsideringRemoteSideDead = 10;

@@ -1,5 +1,7 @@
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using ModemAPI;
@@ -372,6 +374,44 @@ namespace ModemAPI.Tests
             Assert.Throws<InvalidOperationException>(() => new LMDTPServer(link.B, 10, 1, [], false, SrtpTimeoutTicks, 0) { ResourceProvider = resources }.Start());
             Assert.Throws<InvalidOperationException>(() => new LMDTPServer(link.B, 1, 10, [], false, 0, 0) { ResourceProvider = resources }.Start());
             Assert.Throws<InvalidOperationException>(() => new LMDTPServer(link.B, 1, 10, [], false, SrtpTimeoutTicks, -1) { ResourceProvider = resources }.Start());
+            Assert.Throws<InvalidOperationException>(() => new LMDTPServer(link.B, 1, 10, [], false, SrtpTimeoutTicks, 0) { ResourceProvider = resources, SrtpRetransmissionTimeoutTicks = 0 }.Start());
+            Assert.Throws<InvalidOperationException>(() => new LMDTPServer(link.B, 1, 10, [], false, SrtpTimeoutTicks, 0) { ResourceProvider = resources, SrtpInternalStateMaxSize = 0 }.Start());
+        }
+
+        // X4: the window and the packet timeout of the sessions can be set
+
+        [Fact]
+        public void ConstructorTimeoutIsWrittenToTheField()
+        {
+            using FakeLink link = new();
+            LMDTPServer server = new(link.B, 1, 10, [], false, 1_234_567, 0);
+            Assert.Equal(1_234_567, server.SrtpRetransmissionTimeoutTicks);
+            Assert.Equal(1024, server.SrtpInternalStateMaxSize);
+        }
+
+        [Theory]
+        [InlineData(1, 3_000_000)]
+        [InlineData(37, 5_000_000)]
+        public void SessionsTakeTheWindowAndTheTimeoutOfTheServer(int window, int timeoutTicks)
+        {
+            using Setup setup = new();
+            setup.Server.SrtpInternalStateMaxSize = window;
+            setup.Server.SrtpRetransmissionTimeoutTicks = timeoutTicks;
+            byte[] data = RandomBytes(20_000, 12);
+            setup.Resources.Data["r"] = data;
+            var clients = (ConcurrentDictionary<(Address, uint), SRTPClient>)typeof(LMDTPServer).GetField("Clients", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(setup.Server)!;
+            FieldInfo ticksTimeout = typeof(SRTPClient).GetField("TicksTimeout", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            ConcurrentQueue<(int Window, int Timeout)> sessions = new();
+            setup.Server.SRTPClientReceived += (address, cid) =>
+            {
+                SRTPClient session = clients[(address, cid)];
+                sessions.Enqueue((session.MaxUnackedPackets, (int)ticksTimeout.GetValue(session)!));
+            };
+            byte[] received = [];
+            // 20 packets of 1000 bytes: with the window of 1 they go one by one
+            Assert.Null(Guard.RunWithin(TimeSpan.FromSeconds(20), () => received = setup.Client().Request("r", 1_000_000, ClientTimeoutTicks)));
+            Assert.Equal(data, received);
+            Assert.Equal((window, timeoutTicks), Assert.Single(sessions));
         }
 
         [Fact]
