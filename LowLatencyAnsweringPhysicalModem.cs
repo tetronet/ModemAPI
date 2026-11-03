@@ -354,7 +354,8 @@ namespace ModemAPI
                     {
                         L1DroppedData(reason, count);
                     };
-                    p_.InternalErrorHappened += InternalErrorHappened;
+                    p_.MalformedPacketReceived += CallAllEventsOfCrc;
+                    p_.InternalErrorHappened += (e, emitter) => InternalErrorHappened(e, emitter); // a lambda: the handlers attached later get the errors too
                     p = p_;
                 }
                 Communicator = new(null, null, p);
@@ -428,6 +429,8 @@ namespace ModemAPI
             {
                 L1DroppedData(reason, count);
             };
+            mssp.MalformedPacketReceived += CallAllEventsOfCrc;
+            mssp.InternalErrorHappened += (e, emitter) => InternalErrorHappened(e, emitter); // a lambda: the handlers attached later get the errors too
             Communicator = new(null, null, mssp);
             Communicator.Init(L1Types.L1_SERIAL);
             Communicator.ErrorReported = delegate (Exception e) { InternalErrorHappened(e, ErrorEmitter.LowLatencyAnsweringPhysicalModem); };

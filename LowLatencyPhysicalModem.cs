@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO.Hashing;
@@ -13,7 +14,7 @@ using System.Threading.Tasks;
 
 namespace ModemAPI
 {
-    public class LowLatencyPhysicalModem : IModem, ICorruptionAwareModem
+    public class LowLatencyPhysicalModem : IModem, ICorruptionAwareModem, IAnswerHost
     {
         private PNetworkCommunicator Communicator;
         private L1Types LevelOneWireType;
@@ -39,6 +40,15 @@ namespace ModemAPI
         private readonly Lock PacketDispatcherLock = new();
         private bool PacketDispatcherAttached = false;
         private bool AssemblerAttached = false;
+        // slaves: answering modems under this one, and the routing between them and the line, the same as in VirtualModem
+        private readonly Dictionary<string, LowLatencyAnsweringPhysicalModem> SlavePhysicalModems = []; // Slave physical modem list, changed under its own lock
+        private readonly ConcurrentDictionary<string, string> AddressPortPairs = new(); // For slave physical modems
+        private IPacketRouter? InnerRouter = null;
+        private PacketRouter? DefaultRouter = null; // used while no router is attached
+        internal List<string> TakenNumbers = []; // Address Values, that were already taken by the Slave Modems, changed under its own lock
+        private event Action<Packet, Action> InternalPacketEvents = delegate { };
+        private int InternalPacketSubscribers = 0;
+        private int LineRouterAttached = 0;
 
         public int MaxReinitializeAttempts { get; set; }
         /// <summary>
@@ -51,9 +61,18 @@ namespace ModemAPI
         [Obsolete("Large messages in the tetronet must get replaced by LMDTP transfers")]
         public LargeMessage? LastDownloadedLargeMessage { get; set; }
         /// <summary>
-        /// Connect this modem as an address machine.
+        /// Connect this modem as an address machine. If true, modem will be able to have slaves, otherwise, no.
         /// </summary>
         public bool ConnectAsAnAddressMachine { get; set; }
+        /// <summary>
+        /// How many times SMLA address will be regenerated if it's already taken by a slave.
+        /// </summary>
+        public int SMLAMaxRetries = 1000000;
+        public string SlaveLargeMessageExchangeDirectory { get; set; } = "";
+        /// <summary>
+        /// Length of address postfix for the slave modems.
+        /// </summary>
+        public int SMLALength { get; set; }
         /// <summary>
         /// MTU for the Packets
         /// </summary>
@@ -83,7 +102,8 @@ namespace ModemAPI
         /// </summary>
         public event Action<L1DropBytesReasons, int> L1DroppedData = delegate { };
         /// <summary>
-        /// Gets invoked when an error happens in the modem.
+        /// Gets invoked when an error happens in the modem or in one of its slaves (then the emitter is the part of the slave,
+        /// that reported it, for example <see cref="ErrorEmitter.LowLatencyAnsweringPhysicalModem"/> or <see cref="ErrorEmitter.MoreStableSerialPacket"/>).
         /// </summary>
         public event Action<Exception, ErrorEmitter> InternalErrorHappened = delegate { };
 
@@ -359,7 +379,7 @@ namespace ModemAPI
                         L1DroppedData(reason, count);
                     };
                     p_.MalformedPacketReceived += CallAllEventsOfCrc;
-                    p_.InternalErrorHappened += InternalErrorHappened;
+                    p_.InternalErrorHappened += (e, emitter) => InternalErrorHappened(e, emitter); // a lambda: the handlers attached later get the errors too
                     p = p_;
                 }
                 Communicator = new(null, null, p);
@@ -378,7 +398,7 @@ namespace ModemAPI
                     L1DroppedData(reason, count);
                 };
                 mssp.MalformedPacketReceived += CallAllEventsOfCrc;
-                mssp.InternalErrorHappened += InternalErrorHappened;
+                mssp.InternalErrorHappened += (e, emitter) => InternalErrorHappened(e, emitter); // a lambda: the handlers attached later get the errors too
                 Communicator = new(null, null, mssp);
             }
             else if (wt == L1Types.L1_INET_UDP)
@@ -741,6 +761,21 @@ namespace ModemAPI
         public void AttachReceiveEventNoUnfragment(Action<Packet, Action> onReceive)
         {
             PacketSubscribers.Add(onReceive);
+            AttachPacketDispatcher();
+        }
+
+        /// <summary>
+        /// Gets every packet, that came from the line, before the subscribers do; used for the routing to the slaves.
+        /// </summary>
+        internal void InternalAttachReceiveEvent(Action<Packet, Action> onReceive)
+        {
+            InternalPacketEvents += onReceive;
+            Interlocked.Increment(ref InternalPacketSubscribers);
+            AttachPacketDispatcher();
+        }
+
+        private void AttachPacketDispatcher()
+        {
             lock (PacketDispatcherLock)
             {
                 if (!PacketDispatcherAttached)
@@ -759,7 +794,7 @@ namespace ModemAPI
 
         private void DispatchPacket(byte[] b, Action k)
         {
-            if (PacketSubscribers.Count == 0 || !PacketConverter.CheckIsPacket(b))
+            if ((PacketSubscribers.Count == 0 && Volatile.Read(ref InternalPacketSubscribers) == 0) || !PacketConverter.CheckIsPacket(b))
             {
                 return;
             }
@@ -778,7 +813,283 @@ namespace ModemAPI
                 }
                 return;
             }
+            InternalPacketEvents(p, k);
+            // a packet for a slave (or a child of it) is the slave's, as in VirtualModem: the subscribers of this modem don't get it
+            if (PacketSubscribers.Count == 0 || SlaveAddressFor(p.Receiver.AddressValue ?? "") != null)
+            {
+                return;
+            }
             PacketSubscribers.Invoke(p, k);
+        }
+
+        /// <summary>
+        /// Creates a new slave modem for that modem. Works with L1_SERIAL and L1_INET_UDP wireTypes; for TCP use
+        /// <see cref="CreateSlave(Stream, string)"/> with the stream of every connection your own TcpListener accepts.
+        /// </summary>
+        /// <param name="serialPortNumber">L1_SERIAL: serial port of that slave (for example "COM3"). L1_INET_UDP: "ip:port", that the
+        /// slave listens on (for example "0.0.0.0:5000")</param>
+        /// <param name="portSpeed">L1_SERIAL: bitrate. Not used with L1_INET_UDP</param>
+        /// <param name="wireType">L1 type: L1_SERIAL or L1_INET_UDP</param>
+        /// <param name="useMoreStableSerialPacket">L1_SERIAL: frame the line with MSSP. Not used with L1_INET_UDP</param>
+        /// <exception cref="InvalidOperationException">Happens if slave being created without connecting as an Address Machine, or with
+        /// another wireType (TCP)</exception>
+        /// <exception cref="NullAddressException">Happens if slave is being created while the tetronet address of that modem is NULL</exception>
+        /// <exception cref="ArgumentException">There is a slave with this name already</exception>
+        public void CreateSlave(string serialPortNumber, int portSpeed, L1Types wireType, bool useMoreStableSerialPacket = false)
+        {
+            if (!ConnectAsAnAddressMachine)
+            {
+                throw new InvalidOperationException("to create slaves this modem must be connected as an address machine");
+            }
+            if (wireType != L1Types.L1_SERIAL && wireType != L1Types.L1_INET_UDP)
+            {
+                throw new InvalidOperationException("use CreateSlave(Stream, String) method for TCP");
+            }
+            // checked before the port is opened, so a refused slave doesn't keep it
+            CheckSlaveCanBeCreated(serialPortNumber);
+            LowLatencyAnsweringPhysicalModem prepare = new(serialPortNumber, portSpeed, wireType, SlaveLargeMessageExchangeDirectory, useMoreStableSerialPacket);
+            AttachSlave(prepare, serialPortNumber, true);
+        }
+        /// <summary>
+        /// Creates a new slave modem for that modem.
+        /// </summary>
+        /// <param name="baseStream">Stream, which will be used to communicate between modems</param>
+        /// <param name="modemName">Modem name, which will be used to get the modem</param>
+        /// <exception cref="InvalidOperationException">Happens if slave being created without connecting as an Address Machine</exception>
+        /// <exception cref="NullAddressException">Happens if slave is being created while the tetronet address of that modem is NULL</exception>
+        /// <exception cref="ArgumentException">There is a slave with this name already</exception>
+        public LowLatencyAnsweringPhysicalModem CreateSlave(Stream baseStream, string modemName)
+        {
+            if (!ConnectAsAnAddressMachine)
+            {
+                throw new InvalidOperationException("to create slaves this modem must be connected as an address machine");
+            }
+            CheckSlaveCanBeCreated(modemName);
+            LowLatencyAnsweringPhysicalModem prepare = new(baseStream);
+            AttachSlave(prepare, modemName, false);
+            return prepare;
+        }
+        /// <summary>
+        /// Returns all slaves for this modem.
+        /// </summary>
+        /// <returns>Dictionary with "Serial Port Name: Slave Modem" pairs</returns>
+        public Dictionary<string, LowLatencyAnsweringPhysicalModem> GetAnsweringAllModems()
+        {
+            return SlavePhysicalModems;
+        }
+        /// <summary>
+        /// Returns a slave modem by it's serial port number.
+        /// </summary>
+        /// <param name="serialPortNumber">Serial Port Name, e.g. /dev/tty or COM</param>
+        /// <returns>The slave modem</returns>
+        public LowLatencyAnsweringPhysicalModem GetAnsweringModem(string serialPortNumber)
+        {
+            lock (SlavePhysicalModems)
+            {
+                return SlavePhysicalModems[serialPortNumber];
+            }
+        }
+        /// <summary>
+        /// Routes the packets of the slaves with this router instead of the default <see cref="PacketRouter"/> for the address of this modem.
+        /// </summary>
+        public void AttachPacketRouter(IPacketRouter router)
+        {
+            InnerRouter = router;
+        }
+
+        /// <summary>
+        /// The attached router, or, without one, a <see cref="PacketRouter"/> for the current address of this modem; null while it has no address.
+        /// </summary>
+        private IPacketRouter? CurrentRouter()
+        {
+            IPacketRouter? attached = InnerRouter;
+            if (attached != null)
+            {
+                return attached;
+            }
+            Address? local = LocalModemAddress;
+            if (local == null || local.IsEmpty)
+            {
+                return null;
+            }
+            // made again only when the address changes (SMLA of the upper node)
+            PacketRouter? router = DefaultRouter;
+            if (router == null || router.LocalAddress.AddressValue != local.AddressValue)
+            {
+                router = new PacketRouter(Address.Copy(local));
+                DefaultRouter = router;
+            }
+            return router;
+        }
+
+        private void CheckSlaveCanBeCreated(string modemName)
+        {
+            if (LocalModemAddress == null)
+            {
+                throw new NullAddressException("modem is not allowed to have slaves if modem does not own an address");
+            }
+            lock (SlavePhysicalModems)
+            {
+                if (SlavePhysicalModems.ContainsKey(modemName))
+                {
+                    throw new ArgumentException($"there is a slave named {modemName} already", nameof(modemName));
+                }
+            }
+        }
+
+        /// <param name="routeSubAddresses">A packet from a slave to an address under another slave's one goes to that slave
+        /// (VirtualModem does it for serial and UDP slaves); otherwise only to the exact address of a slave</param>
+        private void AttachSlave(LowLatencyAnsweringPhysicalModem prepare, string modemName, bool routeSubAddresses)
+        {
+            prepare.AttachConnectEvent(delegate ()
+            {
+                // Add out subscriber to the data base (needed for routing)
+                AddressPortPairs.TryAdd(prepare.GetSubscriberAddress().AddressValue ?? "", modemName);
+            });
+            // the errors of the slave (for example a failed SMLA) reach the application through this modem
+            prepare.InternalErrorHappened += (e, emitter) => InternalErrorHappened(e, emitter);
+            prepare.AddSMLARequest(SMLARequest);
+            prepare.ModemName = modemName;
+            prepare.AttachIncomingEvent(prepare.Answer);
+            // from the slave: down to the line, or to another slave
+            prepare.InternalAttachReceiveEvent(delegate (Packet data, Action k)
+            {
+                try
+                {
+                    if (data.RoutersToPass == 0)
+                    {
+                        return; // ttl too low
+                    }
+                    // a copy: the received packet is shared by every subscriber of the event
+                    data = ForwardedCopy(data);
+                    PacketRouterDecidion? decision = CurrentRouter()?.Decide(new(data.Transmitter, data.Receiver), PacketTransmissionDirection.FromUpperToLower);
+                    if (decision == PacketRouterDecidion.ForwardDown)
+                    {
+                        Transmit(data);
+                        return;
+                    }
+                    if (decision == PacketRouterDecidion.ForwardInInnerNetwork)
+                    {
+                        string receiver = data.Receiver.AddressValue ?? "";
+                        if (routeSubAddresses)
+                        {
+                            // the address of the slave, that the receiver is under
+                            int slaveAddressLength = (LocalModemAddress?.Length ?? 0) + 1 + SMLALength;
+                            receiver = receiver.Length > slaveAddressLength ? receiver[..slaveAddressLength] : receiver;
+                        }
+                        TransmitToSlave(receiver, data);
+                    }
+                }
+                catch (Exception e)
+                {
+                    InternalErrorHappened(e, ErrorEmitter.LowLatencyPhysicalModem);
+                }
+            });
+            lock (SlavePhysicalModems)
+            {
+                SlavePhysicalModems.Add(modemName, prepare);
+            }
+            // from the line: to the slaves; one handler for all of them
+            if (Interlocked.Exchange(ref LineRouterAttached, 1) == 0)
+            {
+                InternalAttachReceiveEvent(RouteFromLine);
+            }
+        }
+
+        private void RouteFromLine(Packet receivedPacket, Action k)
+        {
+            try
+            {
+                string? receiver = SlaveAddressFor(receivedPacket.Receiver.AddressValue ?? "");
+                if (receiver == null || receivedPacket.RoutersToPass == 0)
+                {
+                    return; // not for a slave, or ttl too low
+                }
+                receivedPacket = ForwardedCopy(receivedPacket);
+                receivedPacket.Metadata ??= "";
+                if (CurrentRouter()?.Decide(new(receivedPacket.Transmitter, receivedPacket.Receiver), PacketTransmissionDirection.FromLowerToUpper) == PacketRouterDecidion.ForwardInInnerNetwork)
+                {
+                    TransmitToSlave(receiver, receivedPacket);
+                }
+            }
+            catch (Exception e)
+            {
+                InternalErrorHappened(e, ErrorEmitter.LowLatencyPhysicalModem);
+            }
+        }
+
+        /// <summary>
+        /// The address of the slave, that the receiver is or is under (a child of a slave, that is an address machine); null if there is none.
+        /// </summary>
+        private string? SlaveAddressFor(string receiver)
+        {
+            if (AddressPortPairs.ContainsKey(receiver))
+            {
+                return receiver;
+            }
+            // the address of a slave is the address of this modem, '-' and SMLALength digits
+            int slaveAddressLength = (LocalModemAddress?.Length ?? 0) + 1 + SMLALength;
+            if (receiver.Length > slaveAddressLength && receiver[slaveAddressLength] == '-' && AddressPortPairs.ContainsKey(receiver[..slaveAddressLength]))
+            {
+                return receiver[..slaveAddressLength];
+            }
+            return null;
+        }
+
+        private void TransmitToSlave(string address, Packet packet)
+        {
+            if (!AddressPortPairs.TryGetValue(address, out string? modemName))
+            {
+                return;
+            }
+            LowLatencyAnsweringPhysicalModem? slave;
+            lock (SlavePhysicalModems)
+            {
+                SlavePhysicalModems.TryGetValue(modemName, out slave);
+            }
+            slave?.TransmitToSubscriber(packet);
+        }
+
+        private Address SMLARequest(string modemName)
+        {
+            if (SMLALength < 1)
+            {
+                throw new InvalidDataException("smla length less than 1");
+            }
+            string number;
+            int retries = 0;
+            lock (TakenNumbers)
+            {
+                while (true)
+                {
+                    if (retries > SMLAMaxRetries)
+                    {
+                        throw new TimeoutException("smla process timed out");
+                    }
+                    number = "";
+                    for (int i = 0; i < SMLALength; i++)
+                    {
+                        number += Random.Shared.Next(10).ToString();
+                    }
+                    if (!TakenNumbers.Contains(number))
+                    {
+                        break;
+                    }
+                    retries++;
+                }
+                TakenNumbers.Add(number);
+            }
+            Address result = new($"{LocalModemAddress}-{number}");
+            AddressPortPairs.TryAdd(result.ToString(), modemName);
+            return result;
+        }
+
+        /// <summary>
+        /// A copy of the packet with one router less to pass. The received packet itself is shared by every subscriber of the event, so it must not change.
+        /// </summary>
+        private static Packet ForwardedCopy(Packet p)
+        {
+            return new Packet(p.Transmitter, p.Receiver, p.DataBytes, p.IsLastInSequence, p.Metadata, p.QueryType, p.ConnectionID, p.IsErrorWhileReading, p.PacketNo, p.MessageId, (ushort)(p.RoutersToPass - 1));
         }
 
         public bool IsAddressSMLA()

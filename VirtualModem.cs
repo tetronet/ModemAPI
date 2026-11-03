@@ -1,5 +1,6 @@
 ﻿using SocketIOClient;
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.IO.Hashing;
 using System.IO.Ports;
 using System.Net.WebSockets;
@@ -31,14 +32,16 @@ namespace ModemAPI
         private readonly Lock PacketDispatcherLock = new();
         private bool PacketDispatcherAttached = false;
         private bool AssemblerAttached = false;
-        private Dictionary<string, LowLatencyAnsweringPhysicalModem> SlavePhysicalModems = []; // Slave physical modem list
-        private Dictionary<string, string> AddressPortPairs = []; // For slave physical modems
+        private readonly Dictionary<string, LowLatencyAnsweringPhysicalModem> SlavePhysicalModems = []; // Slave physical modem list, changed under its own lock
+        private readonly ConcurrentDictionary<string, string> AddressPortPairs = new(); // For slave physical modems
+        private int LineRouterAttached = 0;
         private IPacketRouter? InnerRouter = null;
+        private PacketRouter? DefaultRouter = null; // used while no router is attached
         private bool AddressWasSetByUpperNode = false; // SMLA or not
         private bool InternalModemConnected = false;
         private bool WebSocketOrSocketIO = false; // false if socket.io, true if websocket
         private PacketQueueAssembler QueueAssembler = new(1000000, 600000000);
-        internal List<string> TakenNumbers = []; // Address Values, that were already taken by the Slave Modems
+        internal List<string> TakenNumbers = []; // Address Values, that were already taken by the Slave Modems, changed under its own lock
         public LargeMessage? LastDownloadedLargeMessage { get; set; }
         public bool IsModemConnected { get { return InternalModemConnected && LocalModemAddress != null && !LocalModemAddress.IsEmpty; } }
         /// <summary>
@@ -294,197 +297,165 @@ namespace ModemAPI
         /// <param name="useMoreStableSerialPacket">L1_SERIAL: frame the line with MSSP. Not used with L1_INET_UDP</param>
         /// <exception cref="InvalidOperationException">Happens if slave being created without connecting as an Address Machine, or with
         /// another wireType (TCP)</exception>
-        /// <exception cref="NullReferenceException">Happens if serial port of that modem is NULL</exception>
         /// <exception cref="NullAddressException">Happens if slave is being created while the tetronet address of that modem is NULL</exception>
+        /// <exception cref="ArgumentException">There is a slave with this name already</exception>
         public void CreateSlave(string serialPortNumber, int portSpeed, L1Types wireType, bool useMoreStableSerialPacket = false)
         {
             if (!ConnectAsAnAddressMachine)
             {
                 throw new InvalidOperationException("to create slaves this modem must be connected as an address machine");
             }
-            LowLatencyAnsweringPhysicalModem prepare;
-            if (wireType == L1Types.L1_SERIAL || wireType == L1Types.L1_INET_UDP)
-            {
-                prepare = new(serialPortNumber, portSpeed, wireType, SlaveLargeMessageExchangeDirectory, useMoreStableSerialPacket);
-            }
-            else
+            if (wireType != L1Types.L1_SERIAL && wireType != L1Types.L1_INET_UDP)
             {
                 throw new InvalidOperationException("use CreateSlave(Stream, String) method for TCP");
             }
-            if (LocalModemAddress == null)
-            {
-                throw new NullAddressException("modem is not allowed to have slaves if modem does not own an address");
-            }
-            prepare.AttachConnectEvent(delegate ()
-            {
-                if (!AddressPortPairs.ContainsKey(prepare.GetSubscriberAddress().AddressValue ?? ""))
-                {
-                    // Add out subscriber to the data base (needed for routing)
-                    AddressPortPairs.Add(prepare.GetSubscriberAddress().AddressValue ?? "", serialPortNumber);
-                }
-            });
-            prepare.AddSMLARequest(SMLARequest);
-            prepare.ModemName = serialPortNumber;
-            prepare.AttachIncomingEvent(prepare.Answer);
-            prepare.InternalAttachReceiveEvent(delegate (Packet data, Action k)
-            {
-                //Console.WriteLine("==== [at VirtualModem.cs at line 169] ====");
-                //Console.WriteLine(Environment.StackTrace);
-                //ModemAPIDebugger.PrintOutPacket(data);
-                if (data.RoutersToPass == 0)
-                {
-                    return; // ttl too low
-                }
-                // a copy: the received packet is shared by every subscriber of the event
-                data = ForwardedCopy(data);
-                if (InnerRouter != null && InnerRouter.Decide(new(data.Transmitter, data.Receiver), PacketTransmissionDirection.FromUpperToLower) == PacketRouterDecidion.ForwardDown)
-                {
-                    Transmit(data);
-                    return;
-                }
-                if (InnerRouter != null && InnerRouter.Decide(new(data.Transmitter, data.Receiver), PacketTransmissionDirection.FromUpperToLower) == PacketRouterDecidion.ForwardInInnerNetwork)
-                {
-                    if (AddressPortPairs.TryGetValue(data.Receiver.AddressValue?[..(LocalModemAddress.Length + 1 + SMLALength)] ?? "", out string? value))
-                    {
-                        SlavePhysicalModems[value].TransmitToSubscriber(data);
-                        ModemAPIDebugger.OutputDebugMessage("decidion: forward to the inner network");
-                        return;
-                    }
-                }
-            });
-            InternalAttachReceiveEvent(delegate (Packet receivedPacket, Action stopLoop)
-            {
-                ModemAPIDebugger.OutputDebugMessage($"VirtualModem.cs: forwarding data to slave, dest addr: {receivedPacket.Receiver}");
-                ModemAPIDebugger.OutputDebugMessage("Forwarding to port: " + AddressPortPairs.GetValueOrDefault(receivedPacket.Receiver.AddressValue ?? ""));
-                if (AddressPortPairs.TryGetValue(receivedPacket.Receiver.AddressValue ?? "", out string? value))
-                {
-                    if (receivedPacket.RoutersToPass == 0)
-                    {
-                        return; // ttl too low
-                    }
-                    receivedPacket = ForwardedCopy(receivedPacket);
-                    ModemAPIDebugger.OutputDebugMessage("forward ok");
-                    receivedPacket.Metadata ??= "";
-                    if (InnerRouter != null && InnerRouter.Decide(new(receivedPacket.Transmitter, receivedPacket.Receiver), PacketTransmissionDirection.FromLowerToUpper) == PacketRouterDecidion.ForwardInInnerNetwork)
-                    {
-                        SlavePhysicalModems[value].TransmitToSubscriber(receivedPacket);
-                        ModemAPIDebugger.OutputDebugMessage("decidion: forward to the inner network");
-                        return;
-                    }
-                    // TODO implement this
-                    /*if (InnerRouter != null && receivedPacket.Receiver.ToString().StartsWith('*') && !receivedPacket.Receiver.ToString().StartsWith("**"))
-                    {
-                        InnerRouter.WorkOnReceiveByRouterPacket(receivedPacket);
-                        SlavePhysicalModems[value].TransmitToSubscriber(receivedPacket);
-                        return;
-                    }
-                    if (InnerRouter != null && receivedPacket.Receiver.ToString().StartsWith("**"))
-                    {
-                        SlavePhysicalModems[value].TransmitToSubscriber(InnerRouter.ModifyModifiablePacket(receivedPacket) ?? receivedPacket);
-                        return;
-                    }*/
-                }
-                else
-                {
-                    ModemAPIDebugger.OutputDebugMessage("forward fail");
-                }
-            });
-            SlavePhysicalModems.Add(serialPortNumber, prepare);
+            // checked before the port is opened, so a refused slave doesn't keep it
+            CheckSlaveCanBeCreated(serialPortNumber);
+            LowLatencyAnsweringPhysicalModem prepare = new(serialPortNumber, portSpeed, wireType, SlaveLargeMessageExchangeDirectory, useMoreStableSerialPacket);
+            AttachSlave(prepare, serialPortNumber, true);
         }
         /// <summary>
         /// Creates a new slave modem for that Virtual Modem.
         /// </summary>
         /// <param name="baseStream">Stream, which will be used to communicate between modems</param>
         /// <param name="modemName">Modem name, which will be used to get the modem</param>
-        /// <exception cref="InvalidOperationException"></exception>
-        /// <exception cref="NullAddressException"></exception>
+        /// <exception cref="InvalidOperationException">Happens if slave being created without connecting as an Address Machine</exception>
+        /// <exception cref="NullAddressException">Happens if slave is being created while the tetronet address of that modem is NULL</exception>
+        /// <exception cref="ArgumentException">There is a slave with this name already</exception>
         public LowLatencyAnsweringPhysicalModem CreateSlave(Stream baseStream, string modemName)
         {
             if (!ConnectAsAnAddressMachine)
             {
                 throw new InvalidOperationException("to create slaves this modem must be connected as an address machine");
             }
+            CheckSlaveCanBeCreated(modemName);
             LowLatencyAnsweringPhysicalModem prepare = new(baseStream);
+            AttachSlave(prepare, modemName, false);
+            return prepare;
+        }
+
+        private void CheckSlaveCanBeCreated(string modemName)
+        {
             if (LocalModemAddress == null)
             {
                 throw new NullAddressException("modem is not allowed to have slaves if modem does not own an address");
             }
+            lock (SlavePhysicalModems)
+            {
+                if (SlavePhysicalModems.ContainsKey(modemName))
+                {
+                    throw new ArgumentException($"there is a slave named {modemName} already", nameof(modemName));
+                }
+            }
+        }
+
+        /// <param name="routeSubAddresses">A packet from a slave to an address under another slave's one goes to that slave
+        /// (for serial and UDP slaves); otherwise only to the exact address of a slave</param>
+        private void AttachSlave(LowLatencyAnsweringPhysicalModem prepare, string modemName, bool routeSubAddresses)
+        {
             prepare.AttachConnectEvent(delegate ()
             {
-                if (!AddressPortPairs.ContainsKey(prepare.GetSubscriberAddress().AddressValue ?? ""))
-                {
-                    // Add out subscriber to the data base (needed for routing)
-                    AddressPortPairs.Add(prepare.GetSubscriberAddress().AddressValue ?? "", modemName);
-                }
+                // Add out subscriber to the data base (needed for routing)
+                AddressPortPairs.TryAdd(prepare.GetSubscriberAddress().AddressValue ?? "", modemName);
             });
             prepare.AddSMLARequest(SMLARequest);
             prepare.ModemName = modemName;
             prepare.AttachIncomingEvent(prepare.Answer);
+            // from the slave: down to the tetronet, or to another slave
             prepare.InternalAttachReceiveEvent(delegate (Packet data, Action k)
             {
-                //Console.WriteLine("==== [at VirtualModem.cs at line 169] ====");
-                //Console.WriteLine(Environment.StackTrace);
-                //ModemAPIDebugger.PrintOutPacket(data);
                 if (data.RoutersToPass == 0)
                 {
                     return; // ttl too low
                 }
                 // a copy: the received packet is shared by every subscriber of the event
                 data = ForwardedCopy(data);
-                if (InnerRouter != null && InnerRouter.Decide(new(data.Transmitter, data.Receiver), PacketTransmissionDirection.FromUpperToLower) == PacketRouterDecidion.ForwardDown)
+                PacketRouterDecidion? decision = CurrentRouter()?.Decide(new(data.Transmitter, data.Receiver), PacketTransmissionDirection.FromUpperToLower);
+                if (decision == PacketRouterDecidion.ForwardDown)
                 {
                     Transmit(data);
                     return;
                 }
-                if (InnerRouter != null && InnerRouter.Decide(new(data.Transmitter, data.Receiver), PacketTransmissionDirection.FromUpperToLower) == PacketRouterDecidion.ForwardInInnerNetwork)
+                if (decision == PacketRouterDecidion.ForwardInInnerNetwork)
                 {
-                    if (AddressPortPairs.TryGetValue(data.Receiver.AddressValue ?? "", out string? value))
+                    string receiver = data.Receiver.AddressValue ?? "";
+                    if (routeSubAddresses)
                     {
-                        SlavePhysicalModems[value].TransmitToSubscriber(data);
+                        // the address of the slave, that the receiver is under; a shorter address is taken as it is
+                        int slaveAddressLength = (LocalModemAddress?.Length ?? 0) + 1 + SMLALength;
+                        receiver = receiver.Length > slaveAddressLength ? receiver[..slaveAddressLength] : receiver;
+                    }
+                    if (TransmitToSlave(receiver, data))
+                    {
                         ModemAPIDebugger.OutputDebugMessage("decidion: forward to the inner network");
-                        return;
                     }
                 }
             });
-            InternalAttachReceiveEvent(delegate (Packet receivedPacket, Action stopLoop)
+            lock (SlavePhysicalModems)
             {
-                ModemAPIDebugger.OutputDebugMessage($"VirtualModem.cs: forwarding data to slave, dest addr: {receivedPacket.Receiver}");
-                ModemAPIDebugger.OutputDebugMessage("Forwarding to port: " + AddressPortPairs.GetValueOrDefault(receivedPacket.Receiver.AddressValue ?? ""));
-                if (AddressPortPairs.TryGetValue(receivedPacket.Receiver.AddressValue ?? "", out string? value))
-                {
-                    if (receivedPacket.RoutersToPass == 0)
-                    {
-                        return; // ttl too low
-                    }
-                    receivedPacket = ForwardedCopy(receivedPacket);
-                    ModemAPIDebugger.OutputDebugMessage("forward ok");
-                    receivedPacket.Metadata ??= "";
-                    if (InnerRouter != null && InnerRouter.Decide(new(receivedPacket.Transmitter, receivedPacket.Receiver), PacketTransmissionDirection.FromLowerToUpper) == PacketRouterDecidion.ForwardInInnerNetwork)
-                    {
-                        SlavePhysicalModems[value].TransmitToSubscriber(receivedPacket);
-                        ModemAPIDebugger.OutputDebugMessage("decidion: forward to the inner network");
-                        return;
-                    }
-                    // TODO implement this
-                    /*if (InnerRouter != null && receivedPacket.Receiver.ToString().StartsWith('*') && !receivedPacket.Receiver.ToString().StartsWith("**"))
-                    {
-                        InnerRouter.WorkOnReceiveByRouterPacket(receivedPacket);
-                        SlavePhysicalModems[value].TransmitToSubscriber(receivedPacket);
-                        return;
-                    }
-                    if (InnerRouter != null && receivedPacket.Receiver.ToString().StartsWith("**"))
-                    {
-                        SlavePhysicalModems[value].TransmitToSubscriber(InnerRouter.ModifyModifiablePacket(receivedPacket) ?? receivedPacket);
-                        return;
-                    }*/
-                }
-                else
-                {
-                    ModemAPIDebugger.OutputDebugMessage("forward fail");
-                }
-            });
-            SlavePhysicalModems.Add(modemName, prepare);
-            return prepare;
+                SlavePhysicalModems.Add(modemName, prepare);
+            }
+            // from the tetronet: to the slaves; one handler for all of them, otherwise every packet would go to its slave once per slave
+            if (Interlocked.Exchange(ref LineRouterAttached, 1) == 0)
+            {
+                InternalAttachReceiveEvent(RouteFromTetronet);
+            }
+        }
+
+        private void RouteFromTetronet(Packet receivedPacket, Action stopLoop)
+        {
+            ModemAPIDebugger.OutputDebugMessage($"VirtualModem.cs: forwarding data to slave, dest addr: {receivedPacket.Receiver}");
+            string? receiver = SlaveAddressFor(receivedPacket.Receiver.AddressValue ?? "");
+            if (receiver == null)
+            {
+                ModemAPIDebugger.OutputDebugMessage("forward fail");
+                return;
+            }
+            if (receivedPacket.RoutersToPass == 0)
+            {
+                return; // ttl too low
+            }
+            receivedPacket = ForwardedCopy(receivedPacket);
+            ModemAPIDebugger.OutputDebugMessage("forward ok");
+            receivedPacket.Metadata ??= "";
+            if (CurrentRouter()?.Decide(new(receivedPacket.Transmitter, receivedPacket.Receiver), PacketTransmissionDirection.FromLowerToUpper) == PacketRouterDecidion.ForwardInInnerNetwork)
+            {
+                TransmitToSlave(receiver, receivedPacket);
+                ModemAPIDebugger.OutputDebugMessage("decidion: forward to the inner network");
+            }
+        }
+
+        /// <summary>
+        /// The address of the slave, that the receiver is or is under (a child of a slave, that is an address machine); null if there is none.
+        /// </summary>
+        private string? SlaveAddressFor(string receiver)
+        {
+            if (AddressPortPairs.ContainsKey(receiver))
+            {
+                return receiver;
+            }
+            // the address of a slave is the address of this modem, '-' and SMLALength digits
+            int slaveAddressLength = (LocalModemAddress?.Length ?? 0) + 1 + SMLALength;
+            if (receiver.Length > slaveAddressLength && receiver[slaveAddressLength] == '-' && AddressPortPairs.ContainsKey(receiver[..slaveAddressLength]))
+            {
+                return receiver[..slaveAddressLength];
+            }
+            return null;
+        }
+
+        private bool TransmitToSlave(string address, Packet packet)
+        {
+            if (!AddressPortPairs.TryGetValue(address, out string? modemName))
+            {
+                return false;
+            }
+            LowLatencyAnsweringPhysicalModem? slave;
+            lock (SlavePhysicalModems)
+            {
+                SlavePhysicalModems.TryGetValue(modemName, out slave);
+            }
+            slave?.TransmitToSubscriber(packet);
+            return slave != null;
         }
         /// <summary>
         /// Connects this modem to the tetronet.
@@ -795,7 +766,10 @@ namespace ModemAPI
         /// <returns>The slave modem</returns>
         public LowLatencyAnsweringPhysicalModem GetAnsweringModem(string serialPortNumber)
         {
-            return SlavePhysicalModems[serialPortNumber];
+            lock (SlavePhysicalModems)
+            {
+                return SlavePhysicalModems[serialPortNumber];
+            }
         }
         /// <summary>
         /// Transmits a packet or a packet queue depending on Packet Size and length of data.
@@ -1169,26 +1143,31 @@ namespace ModemAPI
             {
                 throw new InvalidDataException("smla length less than 1");
             }
-            string number = "";
+            string number;
             int retries = 0;
-            while (true)
+            lock (TakenNumbers)
             {
-                if (retries > SMLAMaxRetries)
+                while (true)
                 {
-                    throw new TimeoutException("smla process timed out");
+                    if (retries > SMLAMaxRetries)
+                    {
+                        throw new TimeoutException("smla process timed out");
+                    }
+                    // a new number every time: the taken one isn't extended
+                    number = "";
+                    for (int i = 0; i < SMLALength; i++)
+                    {
+                        number += Random.Shared.Next(10).ToString();
+                    }
+                    if (!TakenNumbers.Contains(number))
+                    {
+                        break;
+                    }
+                    retries++;
                 }
-                for (int i = 0; i < SMLALength; i++)
-                {
-                    number += Random.Shared.Next(10).ToString();
-                }
-                if (!TakenNumbers.Contains(number))
-                {
-                    break;
-                }
-                retries++;
+                TakenNumbers.Add(number);
             }
             Address result = new($"{LocalModemAddress}-{number}");
-            TakenNumbers.Add(number);
             AddressPortPairs.TryAdd(result.ToString(), modemName);
             return result;
         }
@@ -1250,9 +1229,37 @@ namespace ModemAPI
             return new Packet(p.Transmitter, p.Receiver, p.DataBytes, p.IsLastInSequence, p.Metadata, p.QueryType, p.ConnectionID, p.IsErrorWhileReading, p.PacketNo, p.MessageId, (ushort)(p.RoutersToPass - 1));
         }
 
+        /// <summary>
+        /// Routes the packets of the slaves with this router instead of the default <see cref="PacketRouter"/> for the address of this modem.
+        /// </summary>
         public void AttachPacketRouter(IPacketRouter router)
         {
             InnerRouter = router;
+        }
+
+        /// <summary>
+        /// The attached router, or, without one, a <see cref="PacketRouter"/> for the current address of this modem; null while it has no address.
+        /// </summary>
+        private IPacketRouter? CurrentRouter()
+        {
+            IPacketRouter? attached = InnerRouter;
+            if (attached != null)
+            {
+                return attached;
+            }
+            Address? local = LocalModemAddress;
+            if (local == null || local.IsEmpty)
+            {
+                return null;
+            }
+            // made again only when the address changes (SMLA of the upper node)
+            PacketRouter? router = DefaultRouter;
+            if (router == null || router.LocalAddress.AddressValue != local.AddressValue)
+            {
+                router = new PacketRouter(Address.Copy(local));
+                DefaultRouter = router;
+            }
+            return router;
         }
     }
 }
