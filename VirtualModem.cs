@@ -788,6 +788,12 @@ namespace ModemAPI
             {
                 throw new NullAddressException("to transmit, receive or exchange data, modem must have a local address");
             }
+            if (data.Length == 0)
+            {
+                // the loop below sends nothing for empty data: one packet, as LowLevelTransmit sends it
+                LowLevelTransmit([], address, queryType, connectionId, metadata, ttl);
+                return;
+            }
             ulong mid = (ulong)Random.Shared.NextInt64();
             for (int i = 0; i < data.Length; i += packetSize)
             {
@@ -825,6 +831,12 @@ namespace ModemAPI
             if (LocalModemAddress == null)
             {
                 throw new NullAddressException("to transmit, receive or exchange data, modem must have a local address");
+            }
+            if (data.Length == 0)
+            {
+                // the loop below sends nothing for empty data: one packet, as LowLevelTransmit sends it
+                LowLevelTransmit([], address, queryType, connectionId, metadata, ttl);
+                return;
             }
             ulong mid = (ulong)Random.Shared.NextInt64();
             for (int i = 0; i < data.Length; i += packetSize)

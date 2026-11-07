@@ -256,3 +256,98 @@ LMDTP Response Flags:
 0x0010 - the hard drive of the server failed
 0x0100 - the hash field contains XxHash3 instead of SHA-512 (v2)
 ```
+
+# Tetronet Protocols (Application-level)
+### NCCP, aka Network Computers Control Protocol
+Executes a command on a remote computer and brings back its result. Every command is one request and one response, both of them
+ordinary tetronet messages (fragmented, if they don't fit into one packet), sent with ConnectionID 4998512 and query type "command".
+There are no sessions, every command is independent, and the protocol has no standard commands or answers: all of them are defined by the user.
+
+##### Exchange
+```
++---------------------------------------------------------------------------------------------+
+| request                                                                                     |
+| metadata: "q:<request ID>"                    without encryption                            |
+|           "qe:<nonce>:<time>:<tag>"           AES-256-GCM                                   |
+| data:     the command in UTF-8 (encrypted: the ciphertext of it, exactly as long)           |
++---------------------------------------------------------------------------------------------+
+                                              |
+                                              V
++---------------------------------------------------------------------------------------------+
+| response                                                                                    |
+| metadata: "r:<request ID>"                    without encryption                            |
+|           "re:<request nonce>:<nonce>:<tag>"  AES-256-GCM                                   |
+| data:     the result in UTF-8 (encrypted: the ciphertext of it, exactly as long)           |
++---------------------------------------------------------------------------------------------+
+* request ID, nonce - 24 hex digits (12 bytes), new random ones for every request and every response
+* time - 16 hex digits, signed 64-bit Unix time in seconds, when the request was sent
+* tag - 32 hex digits (16 bytes), the AES-GCM tag
+* hex digits are written in lower case and read in any case
+* the response carries the request ID (the request nonce) exactly as it came in the request, the client finds the waiting command by it
+* empty data (an empty command or result) is sent as one packet with no data
+* the response goes to the transmitter address of the request
+```
+##### Commands
+```
+Command;Arg1;Arg2              - calls Command with the arguments Arg1, Arg2
+Command;Arg1;(Other;Arg2)      - calls Other with Arg2 first, then Command with Arg1 and the result of Other
+Command;a(Other;b)c            - text and nested commands next to each other are joined into one argument
+(Name);Arg                     - the name of the command can be the result of a nested command too
+\ \; \( \)                    - escapes of \ ; ( ) in the arguments, the command gets them unescaped
+* Elements are split by ';', so "Command;;x;" has the arguments "", "x", "". An empty command "" is a command with an empty name
+* Any other character after '\', '\' at the end, '(' without ')' and ')' without '(' are syntax errors
+* Nested commands are executed left to right, every one before the command it is an argument of. If one of them fails,
+  the whole command fails, and nothing after it is executed
+* The result of a nested command is used as is, the characters in it aren't syntax anymore
+* The server limits how deep commands are nested (16 by default, 0 - no nesting). It checks the whole command before
+  executing anything: a command nested deeper is answered with an error message (set by the user) and nothing of it is executed
+```
+##### The server always answers
+```
+* An accepted request is always answered, also when the command fails. The answer is the first one, that works:
+  1. the result of the command (an unknown command goes to the handler of unknown commands, which gets its name and arguments)
+  2. the result of the error handler, when the command or the handler of unknown commands threw an exception, returned nothing,
+     or the syntax is wrong
+  3. a fixed message, when even the error handler failed
+* Requests, that aren't accepted (see Encryption), are dropped without an answer, the client times out
+```
+##### Encryption
+```
+AES-256-GCM, 12-byte nonce, 16-byte tag. A key of 32 bytes is known to both sides beforehand and takes the place of a login and
+a password; nothing secret is sent and no key is agreed on the way. The server has a key of its own for every client address,
+so a key taken out of one device doesn't open the others.
+
+AAD (ASCII, not sent, both sides build it themselves):
+  request:  "nccp-q|<client address>|<server address>|<time>"
+  response: "nccp-r|<client address>|<server address>|<request nonce>"
+* client address - the transmitter of the request, server address - the receiver of the request, as they are in the request;
+  <time> and <request nonce> - exactly as they are written in the request metadata
+* the different beginnings keep a request from passing for a response and back
+* the request nonce binds the response to its request: a response to another request (or an old one) doesn't match the tag
+* the addresses keep a request from being taken by another server or from another client, even if they have the same key
+
+The server takes an encrypted request only if all of these hold, checked in this order:
+1. the server uses encryption and has a key for the transmitter address of the request
+2. the tag matches; till then nothing of the request is used, and on a mismatch the command isn't executed
+3. the time differs from the clock of the server by not more than ReplayWindowSeconds (120 by default)
+4. the nonce wasn't taken from this address before
+The server remembers the nonces of the taken requests for twice the window, so a copy of a request is never executed:
+in the window it's a repeated nonce, out of it it's too old. With ReplayWindowSeconds = 0 the time isn't checked (for devices
+without a clock): the server remembers only the last nonces (100000 by default), and a copy can be executed again
+after its nonce is forgotten or after a restart of the server. A client always sends the time.
+
+A server without encryption takes only requests without encryption and passes them to the commands without any checks.
+A server with encryption drops requests without encryption.
+The client takes only a response, that matches what it sent: an encrypted response with a matching tag to an encrypted request,
+a response without encryption to a request without encryption. Other ones are ignored, and the client keeps waiting till its timeout.
+A response repeated or coming after the timeout is ignored too.
+
+* With random nonces, one key should be used for less than 2^32 messages (requests and responses together)
+* Without encryption NCCP has no protection at all: anyone on the route can read, change or send commands
+```
+##### Delivery
+```
+* Delivery isn't guaranteed and nothing is retransmitted: a lost request or response ends in a timeout of the client
+* A timeout doesn't tell, whether the command was executed: maybe only the response was lost. A command repeated after a timeout
+  is a new request and is executed again. Commands, that can be repeated, have to tolerate it (be idempotent): that's up to the user
+```

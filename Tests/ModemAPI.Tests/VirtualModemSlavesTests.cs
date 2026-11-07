@@ -171,6 +171,26 @@ namespace ModemAPI.Tests
         }
 
         [Fact]
+        public void EmptyDataIsTransmittedAsOnePacket()
+        {
+            using Network network = new();
+            network.Master.Transmit([], new Address("7-9"), "q", 7, "m", 1024, 0, 20);
+            network.Master.Transmit("", new Address("7-9"), "q", 8, "m", 1024, 0, 20);
+            Assert.True(SpinWait.SpinUntil(() => network.AtTetronet.Count >= 2, TimeSpan.FromSeconds(5)), "empty data wasn't transmitted");
+            Thread.Sleep(200);
+            Assert.Equal(2, network.AtTetronet.Count);
+            Assert.All(network.AtTetronet, packet =>
+            {
+                Assert.Empty(packet.DataBytes);
+                Assert.Equal(0UL, packet.PacketNo);
+                Assert.True(packet.IsLastInSequence);
+                Assert.Equal("m", packet.Metadata);
+                Assert.Equal(20, packet.RoutersToPass);
+            });
+            Assert.Equal([7u, 8u], network.AtTetronet.Select(p => p.ConnectionID));
+        }
+
+        [Fact]
         public void SmlaRetryGivesANumberOfTheSetLength()
         {
             using Network network = new(smlaLength: 1);
