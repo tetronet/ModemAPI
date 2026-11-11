@@ -163,6 +163,7 @@ The sender:
 * sends messages only while (next sequential number - first unacknowledged number) < 1024 (MaxUnackedPackets, less with the packet loss based congestion control); messages, that are only marked in the bitmap, don't move this window, they are received, but not delivered yet
 * doesn't retransmit messages marked in the bitmap
 * retransmits a message right away, without waiting for the timeout, when it's not marked in the bitmap, but at least 3 (FastRetransmitAfterPackets) messages after it are; it retransmits it again only when messages, sent after that retransmission, are marked and it still isn't
+* with the packet loss based congestion control, halves the window once per loss event: a loss of a message, sent before the last halving, doesn't halve it again (this is the sender's own choice, the receiver doesn't depend on it)
 ```
 ##### Compatibility
 ```

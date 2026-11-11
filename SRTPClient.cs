@@ -78,7 +78,8 @@ namespace ModemAPI
         private long NextSendTimestamp = 0;
         private readonly Lock PacingLock = new();
         private readonly SemaphoreSlim ReorderSignal = new(0, 1);
-        private Stopwatch LastWindowHalvingTimer = Stopwatch.StartNew();
+        // the next sequential number at the last halving of the window: losses of packets sent before it are the same loss event
+        private long RecoveryPoint = 0;
         private bool FailedDueToTooManyRetxAttepms = false;
         private double ThrottlingPower = 0.01;
         // the window size is changed by the receiving thread and the retransmission thread
@@ -239,7 +240,7 @@ namespace ModemAPI
                                 // update timeout
                                 info.UpdateTimeStamp();
                                 // if enabled, pause the transmission
-                                HalveWindowOnLoss();
+                                HalveWindowOnLoss(info.Id);
                                 // call the user event
                                 OnRetransmit(info.Id);
                             }
@@ -544,7 +545,8 @@ namespace ModemAPI
                     info.UpdateTimeStamp();
                     OnRetransmit(info.Id);
                 }
-                HalveWindowOnLoss();
+                // the holes are in ascending order: the last one is the newest loss
+                HalveWindowOnLoss(lost[^1].Id);
             }
         }
         /// <summary>
@@ -649,9 +651,13 @@ namespace ModemAPI
             }
         }
         /// <summary>
-        /// With <see cref="PacketLossBasedCongestionControl"/>, halves the window on a loss, but not more often than once per timeout.
+        /// With <see cref="PacketLossBasedCongestionControl"/>, halves the window on a loss, once per loss event: packets sent
+        /// before the last halving were sent with the old window, so their losses don't halve it again (as TCP NewReno).
+        /// Halving once per timeout instead let the window outgrow the link for seconds on fast links, and the mass losses
+        /// after it stopped the transmission until the retransmission timeout.
         /// </summary>
-        private void HalveWindowOnLoss()
+        /// <param name="lostId">Sequential number of the lost packet</param>
+        private void HalveWindowOnLoss(long lostId)
         {
             if (!PacketLossBasedCongestionControl)
             {
@@ -659,10 +665,10 @@ namespace ModemAPI
             }
             lock (CongestionLock)
             {
-                if (LastWindowHalvingTimer.Elapsed.Ticks > TicksTimeout)
+                if (lostId >= RecoveryPoint)
                 {
                     ThrottlingPower = Math.Clamp(ThrottlingPower / 2, 0.0001, 1);
-                    LastWindowHalvingTimer.Restart();
+                    RecoveryPoint = Interlocked.Read(ref SequentialPacketNumber);
                 }
             }
         }
