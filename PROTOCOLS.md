@@ -351,3 +351,71 @@ A response repeated or coming after the timeout is ignored too.
 * A timeout doesn't tell, whether the command was executed: maybe only the response was lost. A command repeated after a timeout
   is a new request and is executed again. Commands, that can be repeated, have to tolerate it (be idempotent): that's up to the user
 ```
+### UNNRP, aka User Name Network Resolve Protocol
+Maps short names of nodes (UNAMEs, for example `homeserver`) to tetronet addresses (for example `7-415-261-11516-116-11-11591-190-1`)
+and back, like DNS. Formerly UNRP, which worked with one server; with NSS records the servers form a network and redirect the
+clients to each other. Every request and every response is one tetronet packet (not fragmented, not SRTP), without encryption,
+with query type "usernetwork" and no metadata.
+
+##### Exchange
+```
+request:  0x10 [RQ_TYPE uint8] [phrase, N bytes ASCII]
+response: 0x50 [RESPONSE_TYPE uint8] [body]
+* the client takes a new random ConnectionID from 4000 to 800000000 for every request, the server answers with the same
+  ConnectionID to the transmitter address of the request; the client takes a response only with the ConnectionID of a waiting
+  request and only from the address it asked
+* the server answers only data beginning with 0x10 and at least 2 bytes long; responses (0x50) are never answered
+
+RQ_TYPE:
+  0x01 - mapping: the answer of the record for the phrase
+  0x3F - the type of the record, by which the server decides on the phrase
+  0x60 - PING: always answered OK, the phrase is ignored
+  anything else - ERROR
+
+RESPONSE_TYPE:
+  0x01 RESULT    - body: the answer, ASCII (see Records); may be empty
+  0x02 OK        - no body, 2 bytes
+  0x03 REDIRECT  - body: the tetronet address of the UNNRP server to ask instead, ASCII
+  0x04 ERROR     - no body: no record for the phrase, the phrase isn't valid, or an unknown RQ_TYPE
+  0x05 TYPE      - body: 1 byte, the type of the record
+```
+##### Phrase
+```
+The phrase of 0x01 and 0x3F is one of these, checked in this order:
+1. a tetronet address (digits and '-', not at the ends, not two '-' in a row)  -> looked up in the reverse records
+2. "vnet" (any case) followed by decimal digits                                 -> a videonet address, a 128-bit number;
+   leading zeros don't matter, a number over 2^128-1 is ERROR
+3. a UNAME
+4. anything else is ERROR (also bytes over 0x7F)
+
+UNAME: English letters, digits, '-', '_' and '.', at least one character, never two dots in a row ("..").
+Nothing else is allowed. Names are compared without regard to case. Because of the order above, a record can't have a UNAME,
+that is a tetronet address or looks like a videonet address (for example "7-1-23", "123", "vnet5").
+```
+##### Records
+```
+type  record                                                      RESULT of 0x01
+0x01  UNAME -> tetronet address (like A/AAAA)                     the address
+0x20  UNAME -> several tetronet addresses                         the addresses separated by ',' without spaces
+0xFF  UNAME only taken, no mapping                                empty
+0x7F  tetronet address -> UNAME (like PTR)                        the UNAME
+0x88  videonet address -> tetronet address                        the address
+0x40  NSS: wildcard "*.<UNAME>" -> another UNNRP server           REDIRECT instead of RESULT, body: the address of that server
+
+A UNAME is answered by the first one, that matches:
+1. the record of exactly that UNAME (0x01, 0x20, 0xFF)
+2. the NSS record of the longest wildcard: for "a.b.retalog.com" first "*.b.retalog.com", then "*.retalog.com", then "*.com"
+3. ERROR
+* "*.retalog.com" covers names of any depth under it ("a.retalog.com", "a.b.retalog.com"), but not "retalog.com" itself
+* 0x3F is answered with the type of the same record, so an NSS record is answered TYPE 0x40 and not redirected
+* One server has at most one record for one key. UNAMEs of 0x01, 0x20, 0xFF and wildcards of 0x40 share one namespace;
+  0x7F records are keyed by their address and 0x88 by their videonet address, so a name and the reverse record of its
+  address can be on one server
+```
+##### Redirects and delivery
+```
+* On REDIRECT the client sends the same request to the server from the body. It follows at most 8 redirects by default and
+  stops on a redirect to a server, that it asked already in this request (a loop)
+* Delivery isn't guaranteed and nothing is retransmitted: a lost request or response ends in a timeout of the client
+* Without encryption UNNRP has no protection at all: anyone on the route can read or change the answers
+```
