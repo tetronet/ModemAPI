@@ -22,6 +22,10 @@ namespace ModemAPI
         private Stream io;
         private readonly Lock _writeLock = new();
         private Action<byte[], Action> OnReceive = delegate { };
+        // the modems' own handlers: they only look at the data during the call, so a line is decoded into a pooled buffer for them
+        private LineDataHandler OnLine = delegate { };
+        // whether anybody subscribed with OnBufferReceived: such a subscriber may keep the array, so it gets an array of its own
+        private volatile bool HasArraySubscribers = false;
         public event Action<L1DropBytesReasons, int> OnDataDropped = delegate { };
         public event Action MalformedPacketReceived = delegate { };
         public event Action<Exception, ErrorEmitter> InternalErrorHappened = delegate { };
@@ -41,17 +45,21 @@ namespace ModemAPI
 
         public void TransmitBuffer(byte[] buffer)
         {
-            byte[] line = ArrayPool<byte>.Shared.Rent(Base64.GetMaxEncodedToUtf8Length(buffer.Length) + 1);
+            TransmitBuffer(buffer.AsSpan());
+        }
+
+        /// <summary>
+        /// Sends the bytes as one line; the caller may reuse the buffer right after the call (the modems send packets from pooled buffers).
+        /// </summary>
+        internal void TransmitBuffer(ReadOnlySpan<byte> buffer)
+        {
+            byte[] line = ArrayPool<byte>.Shared.Rent(LineLengthFor(buffer.Length));
             try
             {
                 // encoded outside of the lock, so several senders only wait for each other while writing
-                Base64.EncodeToUtf8(buffer, line, out _, out int written);
-                line[written] = 0x0A;
-                lock (_writeLock)
-                {
-                    // one write per packet: the newline used to be a second write, which meant a second system call
-                    io.Write(line, 0, written + 1);
-                }
+                int length = EncodeLine(buffer, line);
+                // one write per packet: the newline used to be a second write, which meant a second system call
+                WriteLines(line.AsSpan(0, length));
                 ModemAPIDebugger.OutputDebugMessage($"sent {buffer.Length} bytes of data");
             }
             finally
@@ -60,10 +68,50 @@ namespace ModemAPI
             }
         }
 
+        /// <summary>
+        /// The most bytes the line of that much data takes, with its '\n'.
+        /// </summary>
+        internal static int LineLengthFor(int dataLength)
+        {
+            return Base64.GetMaxEncodedToUtf8Length(dataLength) + 1;
+        }
+
+        /// <summary>
+        /// Encodes the data as one line (base64 and '\n') into the destination, that has at least <see cref="LineLengthFor"/> bytes.
+        /// </summary>
+        /// <returns>The length of the line</returns>
+        internal static int EncodeLine(ReadOnlySpan<byte> data, Span<byte> destination)
+        {
+            Base64.EncodeToUtf8(data, destination, out _, out int written);
+            destination[written] = 0x0A;
+            return written + 1;
+        }
+
+        /// <summary>
+        /// Writes whole lines with one write: lines of other senders never get in between.
+        /// </summary>
+        internal void WriteLines(ReadOnlySpan<byte> lines)
+        {
+            lock (_writeLock)
+            {
+                io.Write(lines);
+            }
+        }
+
         public void OnBufferReceived(Action<byte[], Action> onReceive)
         {
             ModemAPIDebugger.OutputDebugMessage("Subscribed to the serial buffer");
             OnReceive += onReceive;
+            HasArraySubscribers = true;
+        }
+
+        /// <summary>
+        /// Subscribes a handler, that only looks at every received line during the call (see <see cref="LineDataHandler"/>).
+        /// These handlers are called before the ones of <see cref="OnBufferReceived(Action{byte[], Action})"/>.
+        /// </summary>
+        internal void OnLineReceived(LineDataHandler onLine)
+        {
+            OnLine += onLine;
         }
 
         private void ReaderLoop()
@@ -196,8 +244,13 @@ namespace ModemAPI
         {
             try
             {
-                byte[] packet = DecodeLine(line);
                 ModemAPIDebugger.OutputDebugMessage($"Received data MSSP: {line.Length} base64 bytes");
+                if (!HasArraySubscribers && DecodeLineIntoPool(line))
+                {
+                    return;
+                }
+                byte[] packet = DecodeLine(line);
+                OnLine(packet);
                 OnReceive(packet, delegate () { throw new NotImplementedException(); });
             }
             catch (FormatException fe)
@@ -212,6 +265,35 @@ namespace ModemAPI
             catch (Exception e)
             {
                 InternalErrorHappened(e, ErrorEmitter.MoreStableSerialPacket);
+            }
+        }
+
+        /// <summary>
+        /// Decodes the usual canonical base64 line into a pooled buffer and hands it to <see cref="OnLine"/>, without an array per line.
+        /// </summary>
+        /// <returns>false for unusual input (wrong length, whitespace, invalid characters), that is left to <see cref="DecodeLine"/></returns>
+        private bool DecodeLineIntoPool(ReadOnlySpan<byte> line)
+        {
+            if (line.Length == 0 || line.Length % 4 != 0)
+            {
+                return false;
+            }
+            int padding = line[^1] == (byte)'=' ? (line[^2] == (byte)'=' ? 2 : 1) : 0;
+            int length = line.Length / 4 * 3 - padding;
+            byte[] rented = ArrayPool<byte>.Shared.Rent(length);
+            try
+            {
+                Span<byte> data = rented.AsSpan(0, length);
+                if (Base64.DecodeFromUtf8(line, data, out _, out int written) != OperationStatus.Done || written != length)
+                {
+                    return false;
+                }
+                OnLine(data);
+                return true;
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(rented);
             }
         }
 

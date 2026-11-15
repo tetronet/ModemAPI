@@ -190,6 +190,19 @@ namespace ModemAPI.Tests
             Assert.Equal([7u, 8u], network.AtTetronet.Select(p => p.ConnectionID));
         }
 
+        [Theory]
+        [InlineData(true)]
+        [InlineData(false)]
+        public void PacketForTheNeighbourNetworkGoesToTheTetronet(bool attachRouter)
+        {
+            // 7-10 starts with the characters of 7-1, but isn't under it: the packet goes down, not to a slave, that doesn't exist
+            using Network network = new(attachRouter: attachRouter);
+            var (child, _) = network.UdpChild("u1");
+            child.LowLevelTransmit([42], new Address("7-10-5"), "q", 7, null, 20);
+            Assert.True(SpinWait.SpinUntil(() => !network.AtTetronet.IsEmpty, TimeSpan.FromSeconds(5)), "the packet for 7-10-5 was dropped");
+            Assert.Equal("7-10-5", Assert.Single(network.AtTetronet).Receiver.AddressValue);
+        }
+
         [Fact]
         public void SmlaRetryGivesANumberOfTheSetLength()
         {

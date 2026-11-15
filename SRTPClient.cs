@@ -128,8 +128,10 @@ namespace ModemAPI
         /// </summary>
         public Action<long> OnOutOfOrderPacketReceived = delegate { };
         /// <summary>
-        /// Window size: how far past the first unacknowledged packet the sender may go. Without <see cref="PacketLossBasedCongestionControl"/>
-        /// the whole window is used. Keep it not bigger than the remote side's <see cref="MaxPacketNoFromFuture"/>.
+        /// The largest window: how far past the first unacknowledged packet the sender may go. The sender keeps only about twice
+        /// what the path holds in flight (its delivery rate times its round trip): more packets wouldn't arrive faster, they would
+        /// only wait in queues on the way. With <see cref="PacketLossBasedCongestionControl"/> losses shrink the window too.
+        /// Keep it not bigger than the remote side's <see cref="MaxPacketNoFromFuture"/>.
         /// </summary>
         public int MaxUnackedPackets = 1024;
         /// <summary>
@@ -193,11 +195,22 @@ namespace ModemAPI
                 return ReorderingBuffer.ContainsKey(MissingPacket);
             }
         }
+        // follows the path: see AdaptiveWindow; changed under AcknowledgementLock
+        private readonly AdaptiveWindow DelayWindow = new();
+        // a v1 peer: it acknowledges every packet, without a cumulative number, so a lost acknowledgement holds the window
+        // until the timeout, and the rounds of the adaptive window don't measure the path; such a peer gets the whole window
+        private volatile bool PeerAcknowledgesEveryPacket = false;
+        /// <summary>
+        /// How far past the first unacknowledged packet the sender may go: the adaptive window (or the whole one for a v1 peer),
+        /// with <see cref="PacketLossBasedCongestionControl"/> shrunk by losses too. While a hole waits for its retransmission the
+        /// packets after it count, so a loss slows the sender down instead of letting it refill the queue, that overflowed.
+        /// </summary>
         private int CurrentWindow
         {
             get
             {
-                return PacketLossBasedCongestionControl ? Math.Max(1, (int)(MaxUnackedPackets * ThrottlingPower)) : MaxUnackedPackets;
+                int window = PeerAcknowledgesEveryPacket ? MaxUnackedPackets : DelayWindow.Get(MaxUnackedPackets);
+                return PacketLossBasedCongestionControl ? Math.Min(window, Math.Max(1, (int)(MaxUnackedPackets * ThrottlingPower))) : window;
             }
         }
 
@@ -379,6 +392,7 @@ namespace ModemAPI
                 if (dataReceived.Length == 8)
                 {
                     // == ack receiver ==
+                    PeerAcknowledgesEveryPacket = true;
                     if (InternalState.TryRemove(id, out ReliablePacketInformation? acknowledgedInfo))
                     {
                         OnAckReceived(id);
@@ -387,7 +401,7 @@ namespace ModemAPI
                             long roundTrip = RoundTripOf(acknowledgedInfo);
                             if (roundTrip >= 0)
                             {
-                                SampleRoundTrip(roundTrip);
+                                SampleRoundTrip(roundTrip, id, 1);
                             }
                             AdvanceLowestUnacknowledged();
                         }
@@ -515,6 +529,7 @@ namespace ModemAPI
                 {
                     LowestUnacknowledged = upTo + 1;
                 }
+                long highestAcknowledged = upTo;
                 for (int bit = 0; bit < Math.Min((acknowledgement.Length - 8) * 8, SelectiveAckBits); bit++)
                 {
                     if ((acknowledgement[8 + bit / 8] & (1 << (bit % 8))) != 0 && InternalState.TryRemove(cumulative + 1 + bit, out ReliablePacketInformation? info))
@@ -522,11 +537,12 @@ namespace ModemAPI
                         acknowledged++;
                         OnAckReceived(cumulative + 1 + bit);
                         roundTrip = MinRoundTrip(roundTrip, info);
+                        highestAcknowledged = cumulative + 1 + bit;
                     }
                 }
                 if (roundTrip != long.MaxValue)
                 {
-                    SampleRoundTrip(roundTrip);
+                    SampleRoundTrip(roundTrip, highestAcknowledged, acknowledged);
                 }
                 // the window start doesn't move past selectively acknowledged packets: they are received, but not delivered
                 // yet, and the receiver only takes packets up to its delivered position + MaxPacketNoFromFuture
@@ -569,10 +585,13 @@ namespace ModemAPI
         /// <summary>
         /// Updates the retransmission timeout with a measured round trip, as RFC 6298: SRTT + 4·RTTVAR, not shorter than the
         /// timeout given to the constructor and not longer than 60 s (unless the given timeout is longer).
-        /// Must be called under <see cref="AcknowledgementLock"/>.
+        /// The adaptive window takes the sample too. Must be called under <see cref="AcknowledgementLock"/>.
         /// </summary>
-        private void SampleRoundTrip(long roundTrip)
+        /// <param name="acknowledgedId">The highest sequential number the acknowledgement acknowledged</param>
+        /// <param name="acknowledgedCount">How many packets the acknowledgement acknowledged</param>
+        private void SampleRoundTrip(long roundTrip, long acknowledgedId, int acknowledgedCount)
         {
+            DelayWindow.Sample(roundTrip, acknowledgedId, acknowledgedCount, Interlocked.Read(ref SequentialPacketNumber), MaxUnackedPackets, Stopwatch.GetElapsedTime(0).Ticks);
             if (SmoothedRttTicks < 0)
             {
                 SmoothedRttTicks = roundTrip;

@@ -65,6 +65,7 @@ Low Latency - Copybook Internet over Copybook Internet Lines - mini. How it work
                                  +----------------+
 * Metadata can contain only the symbols from PrintableCharacters string in the PrintableCharacterList.cs file
 * The CRC-32 of the packet is the only little endian field: it's stored the way System.IO.Hashing.Crc32.Hash() writes it
+* The CRC-32 follows the metadata right away: a packet with any bytes between them is rejected as wrongly formatted, even if its CRC-32 matches
 * Over a TCP line (without More Stable Serial Packet) every packet is prefixed with 3 bytes of its length; over UDP every datagram is exactly one packet, without a length (up to 65507 bytes, a datagram may be fragmented by IP)
 ```
 ##### Large Messages
@@ -164,6 +165,7 @@ The sender:
 * doesn't retransmit messages marked in the bitmap
 * retransmits a message right away, without waiting for the timeout, when it's not marked in the bitmap, but at least 3 (FastRetransmitAfterPackets) messages after it are; it retransmits it again only when messages, sent after that retransmission, are marked and it still isn't
 * with the packet loss based congestion control, halves the window once per loss event: a loss of a message, sent before the last halving, doesn't halve it again (this is the sender's own choice, the receiver doesn't depend on it)
+* keeps the window (from the first unacknowledged message) only about twice what the path holds: the highest delivery rate of the last rounds times the smallest round trip, plus 32 messages for the batched acknowledgements, at least 32; every 10 s it sends only 32 for two rounds to measure the round trip without a queue again (the sender's own choice; a v1 peer, that acknowledges every message, gets the whole window)
 ```
 ##### Compatibility
 ```

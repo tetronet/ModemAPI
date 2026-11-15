@@ -148,7 +148,9 @@ namespace ModemAPI
             offset += 2;
             // Get data and metadata for packet
             if (!TryTake(body, ref offset, 2, out ReadOnlySpan<byte> packetData) ||
-                !TryTake(body, ref offset, 2, out ReadOnlySpan<byte> packetMetadata))
+                !TryTake(body, ref offset, 2, out ReadOnlySpan<byte> packetMetadata) ||
+                // the metadata is the last field before the CRC: bytes after it don't belong to any field
+                offset != body.Length)
             {
                 return Errored(PacketReadError.WrongFormat);
             }
@@ -470,22 +472,30 @@ namespace ModemAPI
         }
         public static bool CheckIsPacket(byte[] bytes)
         {
-            return bytes.Length > 8 && bytes.AsSpan(0, 4).SequenceEqual(CIoCILDefaultPhrases.PacketTransferHeader);
+            return CheckIsPacket(bytes.AsSpan());
+        }
+        internal static bool CheckIsPacket(ReadOnlySpan<byte> bytes)
+        {
+            return bytes.Length > 8 && bytes[..4].SequenceEqual(CIoCILDefaultPhrases.PacketTransferHeader);
+        }
+        /// <summary>
+        /// Whether the line data may be a connection request: long enough and starts with its prefix. Checked before anything is
+        /// copied, because the answering modem asks this for every packet it receives.
+        /// </summary>
+        internal static bool MayBeConnectionRequest(ReadOnlySpan<byte> data)
+        {
+            return data.Length >= 17 && data.StartsWith(CIoCILLowLatShortDefaultPhrases.InitConnectionPrefixRequest);
         }
         public static CIoCILLowLatShortConnectionRequestBody ParseLowLatencyConnectionRequest(byte[] request)
         {
-            List<byte> requestCopy = [.. request];
             CIoCILLowLatShortConnectionRequestBody result = new CIoCILLowLatShortConnectionRequestBody();
-            if (requestCopy.Count < 17) // not enough bytes
+            // not enough bytes, or not the correct header; checked on the array, so a packet isn't copied only to be refused
+            if (!MayBeConnectionRequest(request))
             {
                 result.IsRequestDamaged = true;
                 return result;
             }
-            if (!requestCopy.Take(13).SequenceEqual(CIoCILLowLatShortDefaultPhrases.InitConnectionPrefixRequest)) // not correct header
-            {
-                result.IsRequestDamaged = true;
-                return result;
-            }
+            List<byte> requestCopy = [.. request];
             if (Crc32.HashToUInt32([.. requestCopy.SkipLast(4)]) != BinaryPrimitives.ReadUInt32BigEndian([..requestCopy.TakeLast(4)])) // crc mismatch
             {
                 result.IsRequestDamaged = true;

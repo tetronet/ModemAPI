@@ -164,6 +164,16 @@ namespace ModemAPI.Tests
             BinaryPrimitives.WriteUInt32LittleEndian(wrongFormat.AsSpan(wrongFormat.Length - 4), Crc32.HashToUInt32(wrongFormat.AsSpan(0, wrongFormat.Length - 4)));
             Assert.Equal(PacketReadError.WrongFormat, PacketConverter.BytesToPacket(wrongFormat).ReadError);
 
+            // bytes between the metadata and the CRC (with a CRC, that covers them) belong to no field
+            foreach (int extra in new[] { 1, 37 })
+            {
+                byte[] longer = new byte[good.Length + extra];
+                good.AsSpan(0, good.Length - 4).CopyTo(longer);
+                RandomBytes(extra, 5).CopyTo(longer, good.Length - 4);
+                BinaryPrimitives.WriteUInt32LittleEndian(longer.AsSpan(longer.Length - 4), Crc32.HashToUInt32(longer.AsSpan(0, longer.Length - 4)));
+                Assert.Equal(PacketReadError.WrongFormat, PacketConverter.BytesToPacket(longer).ReadError);
+            }
+
             byte[] badMetadata = PacketConverter.PacketToBytes(new Packet { Transmitter = new("7-1-1"), Receiver = new("7-1-2"), QueryType = "q", DataBytes = [1], Metadata = "bad\u0001" });
             Assert.Equal(PacketReadError.WrongMetadata, PacketConverter.BytesToPacket(badMetadata).ReadError);
         }

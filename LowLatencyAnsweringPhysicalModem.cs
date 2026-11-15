@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Collections.Generic;
@@ -294,10 +295,81 @@ namespace ModemAPI
                 }
             }
             /// <summary>
+            /// Sends every packet, that is in the queue now: over MSSP together, with as few writes as possible, otherwise one by one.
+            /// </summary>
+            public void WriteQueued(ChannelReader<Packet> queue, Action<Exception> onError)
+            {
+                if (t == L1Types.L1_SERIAL && sp is MoreStableSerialPacket mssp)
+                {
+                    PacketBatchWriter.WriteQueued(queue, lines =>
+                    {
+                        lock (WriteLock)
+                        {
+                            mssp.WriteLines(lines);
+                        }
+                    }, onError);
+                    return;
+                }
+                while (queue.TryRead(out Packet? packet))
+                {
+                    try
+                    {
+                        WritePacket(packet);
+                    }
+                    catch (Exception e)
+                    {
+                        onError(e);
+                    }
+                }
+            }
+            /// <summary>
+            /// Sends a packet, converted straight into a pooled buffer instead of an array of its own.
+            /// </summary>
+            public void WritePacket(Packet packet)
+            {
+                if (!(t == L1Types.L1_SERIAL && sp is MoreStableSerialPacket) && t != L1Types.L1_INET_UDP)
+                {
+                    // another packetizer, that only takes arrays of its own, and the legacy TCP listener
+                    Write(PacketConverter.PacketToBytes(packet));
+                    return;
+                }
+                int size = PacketConverter.EstimatePacketSize(packet);
+                byte[] rented = ArrayPool<byte>.Shared.Rent(size);
+                try
+                {
+                    Span<byte> bytes = rented.AsSpan(0, size);
+                    PacketConverter.PacketToBytes(packet, bytes);
+                    lock (WriteLock)
+                    {
+                        if (sp is MoreStableSerialPacket mssp)
+                        {
+                            mssp.TransmitBuffer(bytes);
+                        }
+                        else
+                        {
+                            if (udp == null)
+                            {
+                                throw new NullTransmitterException("udp");
+                            }
+                            if (size > L1Framing.MaxDatagramLength)
+                            {
+                                throw new ArgumentOutOfRangeException(nameof(packet), $"a packet sent over UDP must not be longer than {L1Framing.MaxDatagramLength} bytes");
+                            }
+                            IPEndPoint peer = UdpPeer ?? throw new NullTransmitterException("udp: nothing has come from the subscriber yet, so there is nowhere to answer");
+                            udp.Send(bytes, peer);
+                        }
+                    }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(rented);
+                }
+            }
+            /// <summary>
             /// Internal function for adding a on data read event.
             /// </summary>
-            /// <param name="onSuccessfulRead">Callback when a successfull read occured.</param>
-            public void OnDataRead(Action<byte[], Action> onSuccessfulRead)
+            /// <param name="onSuccessfulRead">Callback when a successfull read occured; the data is valid only during the call.</param>
+            public void OnDataRead(LineDataHandler onSuccessfulRead)
             {
                 if (t == L1Types.L1_SERIAL)
                 {
@@ -305,11 +377,18 @@ namespace ModemAPI
                     {
                         throw new NullTransmitterException("sp");
                     }
-                    sp.OnBufferReceived(onSuccessfulRead);
+                    if (sp is MoreStableSerialPacket mssp)
+                    {
+                        mssp.OnLineReceived(onSuccessfulRead);
+                    }
+                    else
+                    {
+                        sp.OnBufferReceived((d, k) => onSuccessfulRead(d));
+                    }
                 }
                 if (t == L1Types.L1_INET_TCP)
                 {
-                    readEvents.Add(onSuccessfulRead); // add event to the list of events
+                    readEvents.Add((d, k) => onSuccessfulRead(d)); // add event to the list of events
                     if (!subscribedForReadingFromTcp)
                     {
                         subscribedForReadingFromTcp = true;
@@ -318,7 +397,7 @@ namespace ModemAPI
                 }
                 if (t == L1Types.L1_INET_UDP)
                 {
-                    readEvents.Add(onSuccessfulRead); // add event to the list of events
+                    readEvents.Add((d, k) => onSuccessfulRead(d)); // add event to the list of events
                     if (!subscribedForReadingFromUdp)
                     {
                         subscribedForReadingFromUdp = true;
@@ -387,17 +466,21 @@ namespace ModemAPI
             Communicator.Init(wt);
             Communicator.ErrorReported = delegate (Exception e) { InternalErrorHappened(e, ErrorEmitter.LowLatencyAnsweringPhysicalModem); };
             Communicator.CanTakeNewSubscriber = CanTakeNewSubscriber;
-            Communicator.OnDataRead(delegate (byte[] d, Action k)
+            Communicator.OnDataRead(delegate (ReadOnlySpan<byte> d)
             {
                 // anything from the subscriber shows it is alive, the answer to Modem-KeepAlive or any other data
                 TrafficSinceKeepAlive = true;
             });
-            Communicator.OnDataRead(delegate (byte[] d, Action k)
+            Communicator.OnDataRead(delegate (ReadOnlySpan<byte> d)
             {
                 // a connection request is answered even during an active connection: the subscriber only asks again when it lost
                 // the connection without saying so (it crashed, or its network changed), and otherwise it couldn't connect anymore.
                 // Only the subscriber's own line can deliver it: the current TCP session, or UDP from its own address and port.
-                CIoCILLowLatShortConnectionRequestBody temp = PacketConverter.ParseLowLatencyConnectionRequest(d);
+                if (!PacketConverter.MayBeConnectionRequest(d))
+                {
+                    return; // a packet or another message: not copied only to be refused
+                }
+                CIoCILLowLatShortConnectionRequestBody temp = PacketConverter.ParseLowLatencyConnectionRequest(d.ToArray());
                 if (!temp.IsRequestDamaged)
                 {
                     HasActiveConnection = false;
@@ -410,7 +493,7 @@ namespace ModemAPI
                     }
                 }
             });
-            Communicator.OnDataRead(delegate (byte[] d, Action k)
+            Communicator.OnDataRead(delegate (ReadOnlySpan<byte> d)
             {
                 if (HasActiveConnection && d.SequenceEqual(CIoCILLowLatShortDefaultPhrases.DisconnectionRequest))
                 {
@@ -435,17 +518,21 @@ namespace ModemAPI
             Communicator.Init(L1Types.L1_SERIAL);
             Communicator.ErrorReported = delegate (Exception e) { InternalErrorHappened(e, ErrorEmitter.LowLatencyAnsweringPhysicalModem); };
             Communicator.CanTakeNewSubscriber = CanTakeNewSubscriber;
-            Communicator.OnDataRead(delegate (byte[] d, Action k)
+            Communicator.OnDataRead(delegate (ReadOnlySpan<byte> d)
             {
                 // anything from the subscriber shows it is alive, the answer to Modem-KeepAlive or any other data
                 TrafficSinceKeepAlive = true;
             });
-            Communicator.OnDataRead(delegate (byte[] d, Action k)
+            Communicator.OnDataRead(delegate (ReadOnlySpan<byte> d)
             {
                 // a connection request is answered even during an active connection: the subscriber only asks again when it lost
                 // the connection without saying so (it crashed, or its network changed), and otherwise it couldn't connect anymore.
                 // Only the subscriber's own line can deliver it: the current TCP session, or UDP from its own address and port.
-                CIoCILLowLatShortConnectionRequestBody temp = PacketConverter.ParseLowLatencyConnectionRequest(d);
+                if (!PacketConverter.MayBeConnectionRequest(d))
+                {
+                    return; // a packet or another message: not copied only to be refused
+                }
+                CIoCILLowLatShortConnectionRequestBody temp = PacketConverter.ParseLowLatencyConnectionRequest(d.ToArray());
                 if (!temp.IsRequestDamaged)
                 {
                     HasActiveConnection = false;
@@ -458,7 +545,7 @@ namespace ModemAPI
                     }
                 }
             });
-            Communicator.OnDataRead(delegate (byte[] d, Action k)
+            Communicator.OnDataRead(delegate (ReadOnlySpan<byte> d)
             {
                 if (HasActiveConnection && d.SequenceEqual(CIoCILLowLatShortDefaultPhrases.DisconnectionRequest))
                 {
@@ -688,17 +775,8 @@ namespace ModemAPI
                 {
                     while (TransmissionQueue.Reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult())
                     {
-                        while (TransmissionQueue.Reader.TryRead(out Packet? thePacket))
-                        {
-                            try
-                            {
-                                Communicator.Write(PacketConverter.PacketToBytes(thePacket));
-                            }
-                            catch (Exception ex)
-                            {
-                                InternalErrorHappened(ex, ErrorEmitter.LowLatencyAnsweringPhysicalModem);
-                            }
-                        }
+                        // everything queued by now goes out together; a write error is reported and the next packets are sent anyway
+                        Communicator.WriteQueued(TransmissionQueue.Reader, ex => InternalErrorHappened(ex, ErrorEmitter.LowLatencyAnsweringPhysicalModem));
                     }
                 })
                 { IsBackground = true, Name = "LowLatencyAnsweringPhysicalModem sender" }.Start();
@@ -706,14 +784,15 @@ namespace ModemAPI
         }
         internal void InternalAttachReceiveEvent(Action<Packet, Action> evt)
         {
-            Communicator.OnDataRead(delegate (byte[] d, Action k)
+            Communicator.OnDataRead(delegate (ReadOnlySpan<byte> d)
             {
                 if (PacketConverter.CheckIsPacket(d))
                 {
+                    // the packet gets its own copy of the data: the line buffer is reused after this call
                     Packet packet = PacketConverter.BytesToPacket(d);
                     if (!packet.IsErrorWhileReading)
                     {
-                        evt(packet, k);
+                        evt(packet, delegate () { throw new NotImplementedException(); });
                     }
                     else
                     {
