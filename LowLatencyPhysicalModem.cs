@@ -491,6 +491,27 @@ namespace ModemAPI
             }
             InitCommunicator(wt == L1Types.L1_INET_TCP && !UsesRawTcp ? L1Types.L1_SERIAL : wt);
         }
+        /// <summary>
+        /// Initializes a LowLatencyPhysicalModem instance over any duplex stream, framed with MSSP: the counterpart of
+        /// <see cref="VirtualModem.CreateSlave(Stream, string)"/> and <see cref="CreateSlave(Stream, string)"/>. For example a named
+        /// pipe to an address machine on the same computer, which is faster than TCP over the loopback.
+        /// </summary>
+        /// <param name="stream">The line: it is read by one thread and written by others at the same time, so a named pipe must be
+        /// opened with <see cref="System.IO.Pipes.PipeOptions.Asynchronous"/> (Windows blocks a write to a synchronous pipe handle,
+        /// while a read of the same handle waits)</param>
+        public LowLatencyPhysicalModem(Stream stream)
+        {
+            LevelOneWireType = L1Types.L1_SERIAL;
+            MoreStableSerialPacket mssp = new(stream);
+            mssp.OnDataDropped += delegate (L1DropBytesReasons reason, int count)
+            {
+                L1DroppedData(reason, count);
+            };
+            mssp.MalformedPacketReceived += CallAllEventsOfCrc;
+            mssp.InternalErrorHappened += (e, emitter) => InternalErrorHappened(e, emitter); // a lambda: the handlers attached later get the errors too
+            Communicator = new(null, null, mssp);
+            InitCommunicator(L1Types.L1_SERIAL);
+        }
 
         private bool UsesRawTcp = false;
         private void InitCommunicator(L1Types wireType)

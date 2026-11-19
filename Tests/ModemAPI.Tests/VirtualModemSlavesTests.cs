@@ -1,4 +1,5 @@
 ﻿using System.Collections.Concurrent;
+using System.IO.Pipes;
 using System.Net;
 using System.Net.Sockets;
 using System.Net.WebSockets;
@@ -201,6 +202,33 @@ namespace ModemAPI.Tests
             child.LowLevelTransmit([42], new Address("7-10-5"), "q", 7, null, 20);
             Assert.True(SpinWait.SpinUntil(() => !network.AtTetronet.IsEmpty, TimeSpan.FromSeconds(5)), "the packet for 7-10-5 was dropped");
             Assert.Equal("7-10-5", Assert.Single(network.AtTetronet).Receiver.AddressValue);
+        }
+
+        [Fact]
+        public void ChildOverANamedPipe()
+        {
+            using Network network = new();
+            string name = "modemapi-test-" + Guid.NewGuid().ToString("N");
+            // asynchronous on both ends: MSSP reads and writes the pipe from different threads at once
+            using NamedPipeServerStream server = new(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+            using NamedPipeClientStream pipe = new(".", name, PipeDirection.InOut, PipeOptions.Asynchronous);
+            Task accepted = server.WaitForConnectionAsync();
+            pipe.Connect(5000);
+            Assert.True(accepted.Wait(TimeSpan.FromSeconds(5)));
+            network.Master.CreateSlave(server, "pipe");
+
+            LowLatencyPhysicalModem child = new(pipe);
+            ConcurrentQueue<Packet> received = new();
+            child.AttachReceiveEventNoUnfragment((p, k) => received.Enqueue(p));
+            child.Dial();
+            Assert.True(SpinWait.SpinUntil(() => child.IsModemConnected, TimeSpan.FromSeconds(5)), "the child didn't connect");
+            Assert.StartsWith("7-1-", child.LocalModemAddress!.AddressValue);
+
+            child.LowLevelTransmit([42], new Address("7-9"), "q", 7, null, 20);
+            Assert.True(SpinWait.SpinUntil(() => !network.AtTetronet.IsEmpty, TimeSpan.FromSeconds(5)), "the packet didn't reach the tetronet");
+            Assert.Equal([42], Assert.Single(network.AtTetronet).DataBytes);
+            network.FromTetronet(PacketOf("7-9", child.LocalModemAddress.AddressValue!, 5));
+            Assert.True(SpinWait.SpinUntil(() => received.Any(p => p.DataBytes[0] == 5), TimeSpan.FromSeconds(5)), "the packet from the tetronet didn't reach the child");
         }
 
         [Fact]

@@ -13,6 +13,12 @@
     /// fast until the path is full. Every 10 s the window drops to the minimum for two rounds to measure the round trip without
     /// a queue again (the route may change, and a queue that never drains would look like the round trip itself).
     /// </para>
+    /// <para>
+    /// Small packets get a cushion of <see cref="CushionBytes"/> on top: every packet costs the modems and the address machines
+    /// some work of its own, and a fuller queue lets them read and write many packets at once, so small packets keep getting
+    /// faster with more of them in flight. The cushion is never more than <see cref="CushionTimeTicks"/> of the delivery rate,
+    /// so on a slow line it is a packet or two and doesn't make a queue there.
+    /// </para>
     /// </summary>
     internal sealed class AdaptiveWindow
     {
@@ -21,6 +27,8 @@
         /// in flight would be acknowledged only by its delay timer.
         /// </summary>
         internal const int MinimumWindow = 32;
+        internal const int CushionBytes = 512 * 1024;
+        internal static readonly long CushionTimeTicks = TimeSpan.FromMilliseconds(5).Ticks;
         // how many times what the path holds may be in flight
         private const double Gain = 2;
         // the delivery rate is the highest of this many last rounds: one slow round doesn't shrink the window
@@ -36,6 +44,8 @@
         // 0: normal, 1: draining the queue before a probe, 2: measuring the round trip without a queue
         private int ProbePhase = 0;
         private int Current = MinimumWindow;
+        // a rough running average of the sent packets: senders may race on it, that doesn't matter
+        private int AveragePacketBytes = 1024;
 
         /// <summary>
         /// The window now: how many packets may be in flight, not more than the given maximum.
@@ -46,15 +56,23 @@
         }
 
         /// <summary>
+        /// Takes the size of a sent packet into the average one, that turns the cushion into packets.
+        /// </summary>
+        internal void PacketSent(int bytes)
+        {
+            int average = Volatile.Read(ref AveragePacketBytes);
+            Volatile.Write(ref AveragePacketBytes, average + (bytes - average) / 8);
+        }
+
+        /// <summary>
         /// Takes an acknowledgement. Called under one lock (the acknowledgement lock of the client).
         /// </summary>
-        /// <param name="roundTripTicks">The smallest round trip of the packets it acknowledged, that weren't retransmitted (not used: the round itself is measured)</param>
         /// <param name="acknowledgedId">The highest sequential number it acknowledged</param>
         /// <param name="acknowledgedCount">How many packets it acknowledged</param>
         /// <param name="nextId">The number the next sent packet will get</param>
         /// <param name="maximum">The largest window allowed (MaxUnackedPackets)</param>
         /// <param name="nowTicks">Now, in TimeSpan ticks of any monotonic clock</param>
-        internal void Sample(long roundTripTicks, long acknowledgedId, int acknowledgedCount, long nextId, int maximum, long nowTicks)
+        internal void Sample(long acknowledgedId, int acknowledgedCount, long nextId, int maximum, long nowTicks)
         {
             if (RoundStartedAt < 0)
             {
@@ -107,8 +125,9 @@
         private int Window(int maximum)
         {
             double rate = Rates.Max();
+            double cushion = Math.Min((double)CushionBytes / Math.Max(1, Volatile.Read(ref AveragePacketBytes)), rate * CushionTimeTicks);
             // room for two acknowledgements of 16 packets each on top of what the path holds
-            double window = Gain * rate * MinRoundTrip + 2 * 16;
+            double window = Gain * rate * MinRoundTrip + cushion + 2 * 16;
             return (int)Math.Clamp(window, MinimumWindow, Math.Max(maximum, MinimumWindow));
         }
     }

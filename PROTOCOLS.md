@@ -165,7 +165,7 @@ The sender:
 * doesn't retransmit messages marked in the bitmap
 * retransmits a message right away, without waiting for the timeout, when it's not marked in the bitmap, but at least 3 (FastRetransmitAfterPackets) messages after it are; it retransmits it again only when messages, sent after that retransmission, are marked and it still isn't
 * with the packet loss based congestion control, halves the window once per loss event: a loss of a message, sent before the last halving, doesn't halve it again (this is the sender's own choice, the receiver doesn't depend on it)
-* keeps the window (from the first unacknowledged message) only about twice what the path holds: the highest delivery rate of the last rounds times the smallest round trip, plus 32 messages for the batched acknowledgements, at least 32; every 10 s it sends only 32 for two rounds to measure the round trip without a queue again (the sender's own choice; a v1 peer, that acknowledges every message, gets the whole window)
+* keeps the window (from the first unacknowledged message) only about twice what the path holds: the highest delivery rate of the last rounds times the smallest round trip, plus 32 messages for the batched acknowledgements, plus 512 KB of small messages (but not more than 5 ms of the delivery rate), at least 32; every 10 s it sends only 32 for two rounds to measure the round trip without a queue again (the sender's own choice; a v1 peer, that acknowledges every message, gets the whole window)
 ```
 ##### Compatibility
 ```

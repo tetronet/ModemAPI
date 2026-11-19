@@ -20,16 +20,22 @@ namespace ModemAPI.Tests
             public double Rate = packetsPerMillisecond / Millisecond;
             public long RoundTrip = roundTripTicks;
             public int Maximum = 1024;
+            // big packets by default: the cushion for small packets is then less than 10 packets
+            public int PacketBytes = 60000;
             public long Now = Millisecond * 1000;
             private long NextId = 0;
 
             public int Round()
             {
                 int window = Window.Get(Maximum);
+                for (int i = 0; i < Math.Min(window, 64); i++)
+                {
+                    Window.PacketSent(PacketBytes);
+                }
                 long first = NextId;
                 NextId += window;
                 Now += Math.Max(RoundTrip, (long)(window / Rate));
-                Window.Sample(RoundTrip, first + window - 1, window, NextId, Maximum, Now);
+                Window.Sample(first + window - 1, window, NextId, Maximum, Now);
                 return window;
             }
         }
@@ -57,14 +63,14 @@ namespace ModemAPI.Tests
                 path.Round();
             }
             int window = path.Window.Get(1024);
-            Assert.InRange(window, 2 * 200, 2 * 200 + 64);
+            Assert.InRange(window, 2 * 200 + 32, 2 * 200 + 32 + 10);
             // a slower path: the window shrinks after the faster rounds leave the rate memory
             path.Rate /= 4;
             for (int i = 0; i < 20; i++)
             {
                 path.Round();
             }
-            Assert.InRange(path.Window.Get(1024), 2 * 50, 2 * 50 + 64);
+            Assert.InRange(path.Window.Get(1024), 2 * 50 + 32, 2 * 50 + 32 + 10);
         }
 
         [Fact]
@@ -92,7 +98,33 @@ namespace ModemAPI.Tests
             Assert.True(probeStart > 0, "no probe");
             Assert.Equal(AdaptiveWindow.MinimumWindow, windows[probeStart + 1]);
             Assert.NotEqual(AdaptiveWindow.MinimumWindow, windows[probeStart + 2]);
-            Assert.InRange(windows[^1], 2 * 400, 2 * 400 + 64);
+            Assert.InRange(windows[^1], 2 * 400 + 32, 2 * 400 + 32 + 10);
+        }
+
+        [Fact]
+        public void SmallPacketsGetACushionButNotOnASlowLine()
+        {
+            // 1 KB packets, 100 per ms for 2 ms: twice the 200 packets the path holds, plus 5 ms of the rate (500 packets, less than 512 KB)
+            Path fast = new(packetsPerMillisecond: 100, roundTripTicks: 2 * Millisecond) { PacketBytes = 1024 };
+            for (int i = 0; i < 100; i++)
+            {
+                fast.Round();
+            }
+            Assert.InRange(fast.Window.Get(2048), 2 * 200 + 32 + 495, 2 * 200 + 32 + 505);
+            // a faster path: the cushion stops at 512 KB
+            Path faster = new(packetsPerMillisecond: 1000, roundTripTicks: Millisecond / 10) { PacketBytes = 1024, Maximum = 4096 };
+            for (int i = 0; i < 100; i++)
+            {
+                faster.Round();
+            }
+            Assert.InRange(faster.Window.Get(4096), 2 * 100 + 32 + 505, 2 * 100 + 32 + 520);
+            // 2 Mbit/s with 1 KB packets (0.25 per ms) and 200 ms (the path holds 50): 5 ms of the rate is about one packet
+            Path slow = new(packetsPerMillisecond: 0.25, roundTripTicks: 200 * Millisecond) { PacketBytes = 1024 };
+            for (int i = 0; i < 100; i++)
+            {
+                slow.Round();
+            }
+            Assert.InRange(slow.Window.Get(1024), 2 * 50 + 32, 2 * 50 + 32 + 2);
         }
 
         [Fact]
@@ -119,6 +151,29 @@ namespace ModemAPI.Tests
                 sender.Transmit([1]);
                 sender.WaitForAcknowledgements();
                 Assert.Equal(sender.MaxUnackedPackets, window.GetValue(sender));
+            }
+            finally
+            {
+                sender.Close();
+                receiver.Close();
+            }
+        }
+
+        [Fact]
+        public void ClientTellsTheWindowTheSizeOfItsPackets()
+        {
+            using FakeLink link = new();
+            SRTPClient sender = new(link.A, link.B.LocalModemAddress!, "q", 9, 10_000_000);
+            SRTPClient receiver = new(link.B, link.A.LocalModemAddress!, "q", 9, 10_000_000);
+            try
+            {
+                for (int i = 0; i < 100; i++)
+                {
+                    sender.Transmit(new byte[50_000]);
+                }
+                AdaptiveWindow window = (AdaptiveWindow)typeof(SRTPClient).GetField("DelayWindow", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(sender)!;
+                int average = (int)typeof(AdaptiveWindow).GetField("AveragePacketBytes", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(window)!;
+                Assert.InRange(average, 49_000, 50_100);
             }
             finally
             {

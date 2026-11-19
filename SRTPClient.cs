@@ -591,7 +591,7 @@ namespace ModemAPI
         /// <param name="acknowledgedCount">How many packets the acknowledgement acknowledged</param>
         private void SampleRoundTrip(long roundTrip, long acknowledgedId, int acknowledgedCount)
         {
-            DelayWindow.Sample(roundTrip, acknowledgedId, acknowledgedCount, Interlocked.Read(ref SequentialPacketNumber), MaxUnackedPackets, Stopwatch.GetElapsedTime(0).Ticks);
+            DelayWindow.Sample(acknowledgedId, acknowledgedCount, Interlocked.Read(ref SequentialPacketNumber), MaxUnackedPackets, Stopwatch.GetElapsedTime(0).Ticks);
             if (SmoothedRttTicks < 0)
             {
                 SmoothedRttTicks = roundTrip;
@@ -837,6 +837,7 @@ namespace ModemAPI
                 BinaryPrimitives.WriteInt64BigEndian(data_.AsSpan(), id);
                 // added before the number is counted: everything below SequentialPacketNumber is waiting or acknowledged
                 InternalState.TryAdd(id, new(id, Stopwatch.GetTimestamp(), data_));
+                DelayWindow.PacketSent(data_.Length);
                 Interlocked.Increment(ref SequentialPacketNumber);
                 UnivSend(data_, StreamDataTag);
             }
