@@ -94,8 +94,9 @@ namespace ModemAPI
         /// <summary>
         /// Allow this modem to drop packets once the line is overloaded (the transmission queue holds 1024 packets): a dropped packet
         /// is counted in <see cref="LocallyDroppedPacketsCounter"/>. True by default: SRTP retransmits what got lost, and LMDTP and NLMNP
-        /// time out or repeat. When false, transmitting waits for space instead; then nothing may transmit from a receive event of this
-        /// modem (SRTP acknowledgements, LMDTP and NLMNP do), because the waiting reader thread can deadlock two busy modems.
+        /// time out or repeat. When false, transmitting waits for space instead, except from a receive event of a LowLatency modem
+        /// (SRTP acknowledgements, LMDTP and NLMNP answers): the reader thread of a line never waits, its packet is dropped and
+        /// counted, because a waiting reader stops receiving and can deadlock two busy modems.
         /// </summary>
         public bool DropPacketsWhenOverloaded { get; set; } = true;
         /// <summary>
@@ -532,18 +533,28 @@ namespace ModemAPI
         {
             // anything from the answering modem shows the connection is alive, Modem-KeepAlive or any other data
             Volatile.Write(ref LastLineTraffic, Stopwatch.GetTimestamp());
-            if (d.SequenceEqual(CIoCILLowLatShortDefaultPhrases.KeepAliveRequest))
+            // answered from the thread pool, not from the reader thread: the write waits while the sender writes, and when the line
+            // doesn't take data, the reader would stop behind it and receive nothing more. One answer at a time is enough
+            if (d.SequenceEqual(CIoCILLowLatShortDefaultPhrases.KeepAliveRequest) && Interlocked.Exchange(ref KeepAliveAnswerPending, 1) == 0)
             {
-                try
+                ThreadPool.UnsafeQueueUserWorkItem(_ =>
                 {
-                    Communicator.Write(CIoCILLowLatShortDefaultPhrases.KeepAliveResponse);
-                }
-                catch (Exception e)
-                {
-                    InternalErrorHappened(e, ErrorEmitter.LowLatencyPhysicalModem);
-                }
+                    try
+                    {
+                        Communicator.Write(CIoCILLowLatShortDefaultPhrases.KeepAliveResponse);
+                    }
+                    catch (Exception e)
+                    {
+                        InternalErrorHappened(e, ErrorEmitter.LowLatencyPhysicalModem);
+                    }
+                    finally
+                    {
+                        Volatile.Write(ref KeepAliveAnswerPending, 0);
+                    }
+                }, null);
             }
         }
+        private int KeepAliveAnswerPending = 0;
         /// <summary>
         /// Watches the connection timeout, that the answering modem gave on connecting: when nothing comes from it for so long, the
         /// connection is considered lost (<see cref="IsModemConnected"/> becomes false), and <see cref="Dial"/> can connect again.
@@ -793,7 +804,8 @@ namespace ModemAPI
             // is dropped and counted, if DropPacketsWhenOverloaded allows that
             if (!TransmissionQueue.Writer.TryWrite(packet))
             {
-                if (DropPacketsWhenOverloaded)
+                // the thread reading a line never waits: it would stop receiving behind a line, that doesn't take packets
+                if (DropPacketsWhenOverloaded || LineReaderThread.IsCurrent)
                 {
                     Interlocked.Increment(ref LocallyDroppedPackets);
                     return;
@@ -917,13 +929,21 @@ namespace ModemAPI
                 }
                 return;
             }
-            InternalPacketEvents(p, k);
-            // a packet for a slave (or a child of it) is the slave's, as in VirtualModem: the subscribers of this modem don't get it
-            if (PacketSubscribers.Count == 0 || SlaveAddressFor(p.Receiver.AddressValue ?? "") != null)
+            LineReaderThread.Enter();
+            try
             {
-                return;
+                InternalPacketEvents(p, k);
+                // a packet for a slave (or a child of it) is the slave's, as in VirtualModem: the subscribers of this modem don't get it
+                if (PacketSubscribers.Count == 0 || SlaveAddressFor(p.Receiver.AddressValue ?? "") != null)
+                {
+                    return;
+                }
+                PacketSubscribers.Invoke(p, k);
             }
-            PacketSubscribers.Invoke(p, k);
+            finally
+            {
+                LineReaderThread.Exit();
+            }
         }
 
         /// <summary>

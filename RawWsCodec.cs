@@ -6,10 +6,11 @@ using System.Text.Json;
 namespace ModemAPI
 {
     /// <summary>
-    /// The "data-transmission" message of RAWWS, written and read straight from UTF-8 bytes. Gives exactly the bytes of
+    /// The "data-transmission" message of RAWWS, written and read straight from UTF-8 bytes. Gives the bytes of
     /// <c>JsonSerializer.SerializeToUtf8Bytes(new object[] { "data-transmission", PacketConverter.PacketToWebSocketMessage(packet) })</c>
-    /// (the same <see cref="Utf8JsonWriter"/> with the same default encoder, the same order of the properties), and reads the
-    /// messages, that the server sends, without strings, lists and reflection in between.
+    /// (the same <see cref="Utf8JsonWriter"/> with the same default encoder, the same order of the properties), except that "+" in
+    /// package_data isn't escaped: the same JSON for every reader. Reads the messages, that the server sends, without strings, lists
+    /// and reflection in between.
     /// </summary>
     internal sealed class RawWsCodec
     {
@@ -17,12 +18,17 @@ namespace ModemAPI
 
         // ---------- writing ----------
 
+        // the start of every message, up to the opening quote of package_data: the first property, as JsonSerializer writes it
+        private static ReadOnlySpan<byte> MessageStart => "[\"data-transmission\",{\"package_data\":\""u8;
+
         private readonly ArrayBufferWriter<byte> Output = new(4096);
+        // the properties after package_data, written as an object of their own and then joined to the message
+        private readonly ArrayBufferWriter<byte> Rest = new(512);
         private readonly Utf8JsonWriter Writer;
 
         public RawWsCodec()
         {
-            Writer = new Utf8JsonWriter(Output);
+            Writer = new Utf8JsonWriter(Rest);
         }
 
         /// <summary>
@@ -32,12 +38,15 @@ namespace ModemAPI
         {
             string receiver = packet.Receiver.AddressValue ?? throw new NullAddressException("receiver address null");
             string transmitter = packet.Transmitter.AddressValue ?? throw new NullAddressException("transmitter address null");
+            // the data, the biggest part, goes straight into the message, once: ["data-transmission",{"package_data":"..."
             Output.ResetWrittenCount();
-            Writer.Reset(Output);
-            Writer.WriteStartArray();
-            Writer.WriteStringValue(DataTransmission);
+            Output.Write(MessageStart);
+            WriteBase64(Output, packet.DataBytes);
+            Output.Write("\""u8);
+            // the small rest by the writer, as {"metadata":...,"package_info":{...}}, joined as ,"metadata":...,"package_info":{...}}]
+            Rest.ResetWrittenCount();
+            Writer.Reset(Rest);
             Writer.WriteStartObject();
-            WriteBase64(Writer, packet.DataBytes);
             Writer.WriteString("metadata"u8, packet.Metadata);
             Writer.WriteStartObject("package_info"u8);
             Writer.WriteNumber("connectionid"u8, packet.ConnectionID);
@@ -50,60 +59,21 @@ namespace ModemAPI
             Writer.WriteNumber("max_hops"u8, packet.RoutersToPass);
             Writer.WriteEndObject();
             Writer.WriteEndObject();
-            Writer.WriteEndArray();
             Writer.Flush();
+            Output.Write(","u8);
+            Output.Write(Rest.WrittenSpan[1..]);
+            Output.Write("]"u8);
             return Output.WrittenMemory;
         }
 
-        private static void WriteBase64(Utf8JsonWriter writer, byte[] data)
+        private static void WriteBase64(ArrayBufferWriter<byte> output, byte[] data)
         {
-            // the string of Convert.ToBase64String, escaped by hand the way the default encoder of the writer does it: of the 65
-            // characters of base64 it escapes only "+" (as +); escaping it character by character in the writer is slow
+            // the string of Convert.ToBase64String, straight into the message: no character of base64 needs escaping in JSON. "+" is
+            // written as it is, not escaped the way JsonSerializer escapes it by default: every JSON reader reads it the same, and
+            // every frame is ~8% shorter, read without unescaping
             int length = Base64.GetMaxEncodedToUtf8Length(data.Length);
-            byte[] rented = ArrayPool<byte>.Shared.Rent(length * 2 + 2);
-            try
-            {
-                Span<byte> base64 = rented.AsSpan(length + 2);
-                Base64.EncodeToUtf8(data, base64, out _, out int written);
-                base64 = base64[..written];
-                int pluses = base64.Count((byte)'+');
-                byte[] json = pluses == 0 ? rented : ArrayPool<byte>.Shared.Rent(written + pluses * 5 + 2);
-                try
-                {
-                    Span<byte> output = json;
-                    int position = 0;
-                    output[position++] = (byte)'"';
-                    while (true)
-                    {
-                        int plus = base64.IndexOf((byte)'+');
-                        ReadOnlySpan<byte> run = plus < 0 ? base64 : base64[..plus];
-                        // copied forward: with no "+" the output is the same buffer in front of the base64, so it never overtakes it
-                        run.CopyTo(output[position..]);
-                        position += run.Length;
-                        if (plus < 0)
-                        {
-                            break;
-                        }
-                        @"\u002B"u8.CopyTo(output[position..]);
-                        position += 6;
-                        base64 = base64[(plus + 1)..];
-                    }
-                    output[position++] = (byte)'"';
-                    writer.WritePropertyName("package_data"u8);
-                    writer.WriteRawValue(output[..position], skipInputValidation: true);
-                }
-                finally
-                {
-                    if (json != rented)
-                    {
-                        ArrayPool<byte>.Shared.Return(json);
-                    }
-                }
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(rented);
-            }
+            Base64.EncodeToUtf8(data, output.GetSpan(length), out _, out int written);
+            output.Advance(written);
         }
 
         private static void WriteAddressParts(Utf8JsonWriter writer, ReadOnlySpan<byte> name, string address)
@@ -207,7 +177,87 @@ namespace ModemAPI
             public ushort? MaxHops;
         }
 
+        // the rest of a message after package_data, read by the JSON reader as [0,{...
+        private byte[] RestBuffer = new byte[512];
+
         private bool TryRead(ReadOnlySpan<byte> message, out Packet? packet)
+        {
+            // a message, that starts the way this codec and JsonSerializer write it: package_data, the biggest part, is read without
+            // the JSON reader, which validates a string with escapes byte by byte, and the small rest is read by the reader as before.
+            // Anything unusual in package_data (another escape, whitespace in the base64) is left to the reader, as it was
+            if (message.StartsWith(MessageStart))
+            {
+                ReadOnlySpan<byte> afterStart = message[MessageStart.Length..];
+                int end = afterStart.IndexOf((byte)'"');
+                if (end >= 0 && TryDecodeEscapedBase64(afterStart[..end], out byte[]? data))
+                {
+                    ReadOnlySpan<byte> tail = afterStart[(end + 1)..].TrimStart(" \t\r\n"u8);
+                    if (!tail.IsEmpty && (tail[0] == (byte)',' || tail[0] == (byte)'}'))
+                    {
+                        // {"package_data":"...","metadata":... is read as {"metadata":..., and {"package_data":"..."} as {}
+                        if (tail[0] == (byte)',')
+                        {
+                            tail = tail[1..];
+                        }
+                        int length = 4 + tail.Length;
+                        if (RestBuffer.Length < length)
+                        {
+                            RestBuffer = new byte[Math.Max(length, RestBuffer.Length * 2)];
+                        }
+                        "[0,{"u8.CopyTo(RestBuffer);
+                        tail.CopyTo(RestBuffer.AsSpan(4));
+                        return TryReadMessage(RestBuffer.AsSpan(0, length), data, out packet);
+                    }
+                }
+            }
+            return TryReadMessage(message, null, out packet);
+        }
+
+        // base64 with only the escapes, that JSON writers put into it ("+" as + or +, "/" as \/), decoded; false for anything else
+        private bool TryDecodeEscapedBase64(ReadOnlySpan<byte> escaped, out byte[]? data)
+        {
+            data = null;
+            if (escaped.IndexOf((byte)'\\') < 0)
+            {
+                return TryDecodeBase64(escaped, out data);
+            }
+            if (UnescapeBuffer.Length < escaped.Length)
+            {
+                UnescapeBuffer = new byte[Math.Max(escaped.Length, UnescapeBuffer.Length * 2)];
+            }
+            Span<byte> output = UnescapeBuffer;
+            int written = 0;
+            ReadOnlySpan<byte> rest = escaped;
+            while (true)
+            {
+                int backslash = rest.IndexOf((byte)'\\');
+                ReadOnlySpan<byte> run = backslash < 0 ? rest : rest[..backslash];
+                run.CopyTo(output[written..]);
+                written += run.Length;
+                if (backslash < 0)
+                {
+                    break;
+                }
+                rest = rest[backslash..];
+                if (rest.Length >= 6 && rest[1] == (byte)'u' && rest.Slice(2, 3).SequenceEqual("002"u8) && (rest[5] == (byte)'B' || rest[5] == (byte)'b'))
+                {
+                    output[written++] = (byte)'+';
+                    rest = rest[6..];
+                }
+                else if (rest.Length >= 2 && rest[1] == (byte)'/')
+                {
+                    output[written++] = (byte)'/';
+                    rest = rest[2..];
+                }
+                else
+                {
+                    return false;
+                }
+            }
+            return TryDecodeBase64(output[..written], out data);
+        }
+
+        private bool TryReadMessage(ReadOnlySpan<byte> message, byte[]? data, out Packet? packet)
         {
             packet = null;
             Utf8JsonReader reader = new(message);
@@ -226,6 +276,12 @@ namespace ModemAPI
                 return false;
             }
             Fields fields = new();
+            if (data != null)
+            {
+                // package_data, read before
+                fields.Data = data;
+                fields.HasData = true;
+            }
             while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
             {
                 if (reader.ValueTextEquals("package_data"u8))

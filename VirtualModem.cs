@@ -1,6 +1,7 @@
 ﻿using SocketIOClient;
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO.Hashing;
 using System.IO.Ports;
 using System.Net.WebSockets;
@@ -24,6 +25,19 @@ namespace ModemAPI
         // RAWWS: one reconnection at a time, shared by the receive loop and every sender
         private readonly Lock ReconnectLock = new();
         private Task? ReconnectTask = null;
+        // RAWWS: limits of the operations with the WebSocket. Without them one stuck connect or send holds RawSendLock forever,
+        // and the receive loop, that answers SRTP from the subscribers, stops behind it: the whole modem hangs
+        internal TimeSpan RawConnectTimeout = TimeSpan.FromSeconds(15);
+        internal TimeSpan RawSendTimeout = TimeSpan.FromSeconds(15);
+        // a WebSocket ping every interval, the connection is aborted without a pong within the timeout: a half-open connection,
+        // that would make ReceiveAsync wait forever, is found and replaced
+        internal TimeSpan RawKeepAliveInterval = TimeSpan.FromSeconds(15);
+        internal TimeSpan RawKeepAliveTimeout = TimeSpan.FromSeconds(15);
+        // the send in progress (under RawSendLock): when it started (Stopwatch, 0 when none) and on which socket. One watch per modem
+        // aborts a send, that takes longer than RawSendTimeout, instead of a timer for every send
+        private long RawSendStartedAt = 0;
+        private ClientWebSocket? RawSendingSocket = null;
+        private Timer? RawSendWatch = null;
         private object PacketBufferLock = new object();
         private SortedDictionary<ulong, SortedDictionary<ulong, Packet>> PacketBuffer = new SortedDictionary<ulong, SortedDictionary<ulong, Packet>>();
         private event Action<Packet, Action> InternalPacketEvents = delegate { };
@@ -562,7 +576,7 @@ namespace ModemAPI
                     ClientWebSocket firstSocket = RawTransmitterDevice;
                     try
                     {
-                        await firstSocket.ConnectAsync(new Uri(Cias), default);
+                        await ConnectRawAsync(firstSocket);
                     }
                     catch
                     {
@@ -706,7 +720,16 @@ namespace ModemAPI
             }
             if (IsWithin(receiverAddress, localAddress) && !IsWithin(transmitterAddress, localAddress))
             {
-                InternalPacketEvents(receivedPacket, delegate () { throw new NotImplementedException("was unable to remove the event"); });
+                // the receive loop forwards to the slaves: it must not wait for a slave line, that doesn't take packets
+                LineReaderThread.Enter();
+                try
+                {
+                    InternalPacketEvents(receivedPacket, delegate () { throw new NotImplementedException("was unable to remove the event"); });
+                }
+                finally
+                {
+                    LineReaderThread.Exit();
+                }
                 GenericPacketCounter++;
             }
         }
@@ -725,12 +748,83 @@ namespace ModemAPI
             await RawSendLock.WaitAsync();
             try
             {
-                await RawTransmitterDevice!.SendAsync(message, WebSocketMessageType.Text, true, default);
+                // a send aborted by the watch fails here, and the receive loop then fails on the socket and reconnects
+                ClientWebSocket socket = RawTransmitterDevice!;
+                BeginRawSend(socket);
+                try
+                {
+                    await socket.SendAsync(message, WebSocketMessageType.Text, true, default);
+                }
+                finally
+                {
+                    EndRawSend();
+                }
             }
             finally
             {
                 RawSendLock.Release();
             }
+        }
+
+        // called under RawSendLock, right before a send
+        private void BeginRawSend(ClientWebSocket socket)
+        {
+            if (RawSendWatch == null)
+            {
+                // checked a few times per limit, but not more often than every 50 ms or less often than every second
+                TimeSpan period = TimeSpan.FromMilliseconds(Math.Clamp(RawSendTimeout.TotalMilliseconds / 4, 50, 1000));
+                // the timer holds the modem only weakly: a modem, that nobody uses anymore, is collected, and its watch stops
+                WeakReference<VirtualModem> modem = new(this);
+                Timer? watch = null;
+                watch = new Timer(_ =>
+                {
+                    if (modem.TryGetTarget(out VirtualModem? target))
+                    {
+                        target.CheckRawSend();
+                    }
+                    else
+                    {
+                        watch?.Dispose();
+                    }
+                }, null, period, period);
+                RawSendWatch = watch;
+            }
+            RawSendingSocket = socket;
+            Volatile.Write(ref RawSendStartedAt, Stopwatch.GetTimestamp());
+        }
+
+        private void EndRawSend()
+        {
+            Volatile.Write(ref RawSendStartedAt, 0);
+        }
+
+        // a send, that takes longer than RawSendTimeout, is stuck: a server, that doesn't read, or a dead connection would hold it, and
+        // RawSendLock with it, forever. Aborting the socket ends the send with an exception, and the modem reconnects
+        private void CheckRawSend()
+        {
+            long started = Volatile.Read(ref RawSendStartedAt);
+            ClientWebSocket? socket = RawSendingSocket;
+            if (started == 0 || Stopwatch.GetElapsedTime(started) <= RawSendTimeout)
+            {
+                return;
+            }
+            // still the same send: one, that has just started, isn't aborted for the one before it
+            if (Volatile.Read(ref RawSendStartedAt) == started)
+            {
+                socket?.Abort();
+            }
+        }
+
+        /// <summary>
+        /// Connects a new RAWWS socket within <see cref="RawConnectTimeout"/>: a server, that accepts TCP but never finishes
+        /// the TLS handshake or the HTTP upgrade, doesn't hold the connection forever.
+        /// </summary>
+        private async Task ConnectRawAsync(ClientWebSocket socket)
+        {
+            socket.Options.KeepAliveInterval = RawKeepAliveInterval;
+            socket.Options.KeepAliveTimeout = RawKeepAliveTimeout;
+            using CancellationTokenSource limit = new(RawConnectTimeout);
+            await socket.ConnectAsync(new Uri(Cias), limit.Token);
         }
 
         /// <summary>
@@ -888,12 +982,16 @@ namespace ModemAPI
                 {
                     throw new InvalidOperationException("transmitter device null");
                 }
+                ClientWebSocket? lost = null;
                 RawSendLock.Wait();
                 try
                 {
                     // the same bytes as JsonSerializer.SerializeToUtf8Bytes(new object[] { "data-transmission", PacketToWebSocketMessage(packet) })
                     MemoryMarshal.TryGetArray(RawSendCodec.WriteDataTransmission(packet), out ArraySegment<byte> payload);
                     ClientWebSocket socket = RawTransmitterDevice;
+                    // a server, that doesn't read, or a dead connection would hold the send, and RawSendLock with it, forever:
+                    // the watch aborts the socket of a send, that takes longer than RawSendTimeout
+                    BeginRawSend(socket);
                     try
                     {
                         // GetResult, not Wait: the exception of the send itself is caught, not an AggregateException around it
@@ -902,12 +1000,22 @@ namespace ModemAPI
                     catch (Exception e) when (e is WebSocketException or OperationCanceledException or InvalidOperationException or ObjectDisposedException)
                     {
                         // the connection is lost: the packet is lost with it, as on any line
-                        ReconnectAsync(socket).GetAwaiter().GetResult();
+                        lost = socket;
+                    }
+                    finally
+                    {
+                        EndRawSend();
                     }
                 }
                 finally
                 {
                     RawSendLock.Release();
+                }
+                if (lost != null)
+                {
+                    // not waited for: the reconnection may take long, and the caller may be the receive loop answering a packet.
+                    // Until it ends, sends fail at once on the closed socket and their packets are lost
+                    _ = ReconnectAsync(lost);
                 }
             }
             GenericPacketCounter++;
@@ -1216,7 +1324,7 @@ namespace ModemAPI
                 try
                 {
                     OnReconnectWebsocket();
-                    await fresh.ConnectAsync(new Uri(Cias), default);
+                    await ConnectRawAsync(fresh);
                     lock (ReconnectLock)
                     {
                         RawTransmitterDevice = fresh;

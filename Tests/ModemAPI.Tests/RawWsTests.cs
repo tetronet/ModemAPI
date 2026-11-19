@@ -61,16 +61,34 @@ namespace ModemAPI.Tests
                 (uint)random.NextInt64(0, uint.MaxValue + 1L), false, (ulong)random.NextInt64(), (ulong)random.NextInt64() * 2, (ushort)random.Next(0, 65536));
         }
 
+        /// <summary>
+        /// The bytes of the old code with "+" in package_data as it is instead of escaped; everything else the same.
+        /// </summary>
+        private static byte[] ExpectedWrite(Packet packet)
+        {
+            // the old code writes plain ASCII (its encoder escapes everything else), and package_data is the first string after its name
+            string text = Encoding.ASCII.GetString(OldWrite(packet));
+            int start = text.IndexOf("\"package_data\":\"", StringComparison.Ordinal) + "\"package_data\":\"".Length;
+            int end = text.IndexOf('"', start);
+            return Encoding.ASCII.GetBytes(text[..start] + text[start..end].Replace(Bs + "u002B", "+") + text[end..]);
+        }
+
         [Fact]
-        public void WritingGivesTheBytesOfTheOldCode()
+        public void WritingGivesTheBytesOfTheOldCodeWithPlusAsItIs()
         {
             Random random = new(1);
             RawWsCodec codec = new();
+            int pluses = 0;
             for (int i = 0; i < 3000; i++)
             {
                 Packet packet = RandomPacket(random);
-                Assert.Equal(OldWrite(packet), codec.WriteDataTransmission(packet).ToArray());
+                byte[] written = codec.WriteDataTransmission(packet).ToArray();
+                Assert.Equal(ExpectedWrite(packet), written);
+                // the same JSON: the old code reads the packet from it
+                AssertSamePacket(packet, OldRead(written)!);
+                pluses += Convert.ToBase64String(packet.DataBytes).Count(c => c == '+');
             }
+            Assert.True(pluses > 1000, "the data had almost no \"+\" in base64");
         }
 
         [Fact]
@@ -83,7 +101,7 @@ namespace ModemAPI.Tests
             Assert.Throws<NullAddressException>(() => codec.WriteDataTransmission(noTransmitter));
             // and works on after that
             Packet good = new() { Transmitter = new("7-1-1"), Receiver = new("7-1-2"), QueryType = "q", DataBytes = [1] };
-            Assert.Equal(OldWrite(good), codec.WriteDataTransmission(good).ToArray());
+            Assert.Equal(ExpectedWrite(good), codec.WriteDataTransmission(good).ToArray());
         }
 
         [Fact]
@@ -163,6 +181,63 @@ namespace ModemAPI.Tests
             foreach (int i in new[] { 0, 1, 2, 3 })
             {
                 Assert.True(codec.TryReadDataTransmission(Encoding.UTF8.GetBytes(MessageTexts[i]), out _), $"message {i}");
+            }
+        }
+
+        // ---------- package_data read without the JSON reader ----------
+
+        private const string Info = "\"metadata\":null,\"package_info\":{\"connectionid\":1,\"from\":[\"7\"],\"to\":[\"8\"],\"package_type\":\"q\",\"is_last_in_package_queue\":false,\"package_no\":1,\"message_id\":1}";
+        private const string Bs = "\\";
+
+        private static readonly string[] PackageDataArray =
+        [
+            // "+" escaped the way JsonSerializer does it, in lower case, "/" escaped, both; whitespace after the data
+            "[\"data-transmission\",{\"package_data\":\"" + Bs + "u002B/" + Bs + "u002B/\"," + Info + "}]",
+            "[\"data-transmission\",{\"package_data\":\"" + Bs + "u002b/" + Bs + "u002b/\"," + Info + "}]",
+            "[\"data-transmission\",{\"package_data\":\"+" + Bs + "/+/\"," + Info + "}]",
+            "[\"data-transmission\",{\"package_data\":\"AQID\" , " + Info + "}]",
+            // the data alone, then the fields in another object of the array; the data repeated later
+            "[\"data-transmission\",{\"package_data\":\"AQID\"}]",
+            "[\"data-transmission\",{\"package_data\":\"AQID\"," + Info + ",\"package_data\":\"AgI=\"}]",
+            // anything else is left to the reader: other escapes, a broken escape, an escaped quote, whitespace in the data, broken JSON after it
+            "[\"data-transmission\",{\"package_data\":\"" + Bs + "u0041QID\"," + Info + "}]",
+            "[\"data-transmission\",{\"package_data\":\"AQI" + Bs + "u002\"," + Info + "}]",
+            "[\"data-transmission\",{\"package_data\":\"AQID" + Bs + "\"," + Info + "}]",
+            "[\"data-transmission\",{\"package_data\":\"AQID" + Bs + "\"\"," + Info + "}]",
+            "[\"data-transmission\",{\"package_data\":\"AQ" + Bs + "nID\"," + Info + "}]",
+            "[\"data-transmission\",{\"package_data\":\"AQID\",," + Info + "}]",
+            "[\"data-transmission\",{\"package_data\":\"AQID\"," + Info + ",}]",
+            "[\"data-transmission\",{\"package_data\":\"AQID\"" + Info + "}]",
+            "[\"data-transmission\",{\"package_data\":\"AQID\"}," + Info + "]",
+            "[\"data-transmission\",{\"package_data\":\"AQID\"," + Info + "}] x",
+        ];
+
+        public static TheoryData<string> PackageDataTexts => new(PackageDataArray);
+
+        [Theory]
+        [MemberData(nameof(PackageDataTexts))]
+        public void PackageDataReadWithoutTheReaderGivesWhatTheOldCodeGave(string text) => ReadingAnyMessageGivesWhatTheOldCodeGave(text);
+
+        [Fact]
+        public void EscapedDataIsReadTheFastWay()
+        {
+            RawWsCodec codec = new();
+            foreach (int i in new[] { 0, 1, 2, 3 })
+            {
+                Assert.True(codec.TryReadDataTransmission(Encoding.UTF8.GetBytes(PackageDataArray[i]), out Packet? packet), $"message {i}");
+                Assert.Equal(Convert.FromBase64String(i == 3 ? "AQID" : "+/+/"), packet!.DataBytes);
+            }
+            // everything the old code writes is read the fast way, "+" escaped or not
+            Random random = new(3);
+            for (int i = 0; i < 500; i++)
+            {
+                Packet sent = RandomPacket(random);
+                sent.Metadata = "m";
+                sent.QueryType = "q";
+                sent.Transmitter = new Address("7-1");
+                sent.Receiver = new Address("7-2");
+                Assert.True(codec.TryReadDataTransmission(OldWrite(sent), out Packet? packet), $"packet {i}");
+                Assert.Equal(sent.DataBytes, packet!.DataBytes);
             }
         }
 
@@ -308,7 +383,7 @@ namespace ModemAPI.Tests
                 Parallel.For(0, 400, new ParallelOptions { MaxDegreeOfParallelism = 8 }, i =>
                 {
                     Packet packet = new(new Address("7-1-1"), new Address("7-2-" + i), RandomBytes(new Random(i), 1000 + i * 37), true, "m" + i, "q", (uint)i, false, 0, (ulong)i, 9);
-                    expected[i.ToString()] = OldWrite(packet);
+                    expected[i.ToString()] = ExpectedWrite(packet);
                     modem.Transmit(packet);
                 });
                 Assert.True(SpinWait.SpinUntil(() => server.Received.Count == 400, TimeSpan.FromSeconds(10)), $"{server.Received.Count} of 400 arrived");

@@ -70,7 +70,8 @@ namespace ModemAPI
         /// <summary>
         /// Allow this modem to drop packets for its subscriber once the line is overloaded (the transmission queue holds 1024 packets):
         /// a dropped packet is counted in <see cref="LocallyDroppedPacketsCounter"/>. True by default, because the address machine
-        /// forwards packets from one thread for all of its lines, and one slow line must not hold up the others; when false, forwarding waits for space.
+        /// forwards packets from one thread for all of its lines, and one slow line must not hold up the others; when false, forwarding waits for space,
+        /// except from the reader thread of a LowLatency modem's line, that never waits (its packet is dropped and counted).
         /// </summary>
         public bool DropPacketsWhenOverloaded { get; set; } = true;
         /// <summary>
@@ -751,7 +752,8 @@ namespace ModemAPI
             // is dropped and counted, if DropPacketsWhenOverloaded allows that
             if (!TransmissionQueue.Writer.TryWrite(packet))
             {
-                if (DropPacketsWhenOverloaded)
+                // the thread reading a line never waits: it would stop receiving behind a line, that doesn't take packets
+                if (DropPacketsWhenOverloaded || LineReaderThread.IsCurrent)
                 {
                     Interlocked.Increment(ref LocallyDroppedPackets);
                     return;
@@ -792,7 +794,15 @@ namespace ModemAPI
                     Packet packet = PacketConverter.BytesToPacket(d);
                     if (!packet.IsErrorWhileReading)
                     {
-                        evt(packet, delegate () { throw new NotImplementedException(); });
+                        LineReaderThread.Enter();
+                        try
+                        {
+                            evt(packet, delegate () { throw new NotImplementedException(); });
+                        }
+                        finally
+                        {
+                            LineReaderThread.Exit();
+                        }
                     }
                     else
                     {
