@@ -1,4 +1,6 @@
-﻿namespace ModemAPI
+﻿using System.Net.Sockets;
+
+namespace ModemAPI
 {
     /// <summary>
     /// Frames of the TCP level one wire of the low latency modems: 3 bytes of big-endian length, then the data.
@@ -14,6 +16,35 @@
         /// A tetronet packet of the biggest SRTP message is about 60 KB, so it fits.
         /// </summary>
         public const int MaxDatagramLength = 65507;
+        /// <summary>
+        /// Receive and send buffers of a UDP line socket. The default (64 KB on Windows) holds about 45 datagrams of 1400 bytes:
+        /// a burst overflows it while the reader thread waits for the core, and the datagrams are lost (13% at 300 Mbit/s with
+        /// one core for each bridge; 0.1% with these buffers). On Linux the kernel cuts it to net.core.rmem_max and
+        /// net.core.wmem_max (about 208 KB by default) without an error, so a busy server raises those with sysctl.
+        /// </summary>
+        public const int UdpSocketBufferSize = 16 * 1024 * 1024;
+
+        /// <summary>
+        /// Sets the buffers of a UDP line socket to <see cref="UdpSocketBufferSize"/>. A system, that refuses so big buffers
+        /// (macOS above kern.ipc.maxsockbuf), keeps its own: the line works anyway, only bursts are lost sooner.
+        /// </summary>
+        public static void SetUdpSocketBuffers(Socket socket)
+        {
+            try
+            {
+                socket.ReceiveBufferSize = UdpSocketBufferSize;
+            }
+            catch (SocketException)
+            {
+            }
+            try
+            {
+                socket.SendBufferSize = UdpSocketBufferSize;
+            }
+            catch (SocketException)
+            {
+            }
+        }
 
         /// <summary>
         /// Builds a frame: the length header followed by the data.

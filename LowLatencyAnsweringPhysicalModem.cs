@@ -66,6 +66,7 @@ namespace ModemAPI
                 SingleWriter = false
             });
         private volatile bool TxLoopWorking = false;
+        private readonly SenderWakeup TxWakeup = new();
         private long LocallyDroppedPackets = 0;
         /// <summary>
         /// Allow this modem to drop packets for its subscriber once the line is overloaded (the transmission queue holds 1024 packets):
@@ -98,15 +99,18 @@ namespace ModemAPI
             public ISerialPacket? sp;
             private bool subscribedForReadingFromTcp = false;
             private bool subscribedForReadingFromUdp = false;
-            List<Action<byte[], Action>> readEvents = [];
+            // copied on every change, so the reader thread goes through it without a lock or a copy for every datagram
+            private LineDataHandler[] readEvents = [];
+            private readonly Lock readEventsLock = new();
             private bool isInitialized = false;
             private L1Types t;
             private List<byte> L1RxBuffer = [];
             public Action<Exception> ErrorReported = delegate { };
             // UDP: whether a new subscriber may take the line now (the modem says so while it has no active connection)
             public Func<bool> CanTakeNewSubscriber = () => true;
-            // UDP: where the subscriber sends from; the answers go there
-            private volatile IPEndPoint? UdpPeer;
+            // UDP: where the subscriber sends from; the answers go there. Never changed once set (a new peer is a new object), so
+            // the sender uses it without a lock; kept as a SocketAddress, so neither receiving nor sending makes an IPEndPoint
+            private volatile SocketAddress? UdpPeer;
 
             public PNetworkCommunicator(TcpListener? tcp, UdpClient? udp, ISerialPacket? sp)
             {
@@ -167,7 +171,7 @@ namespace ModemAPI
                         ModemAPIDebugger.OutputDebugMessage($"low latency ans physical modem received data from tcp");
                         L1RxBuffer.AddRange(buffer.AsSpan(0, read));
                         // one read may carry several frames, all of them must be handled before blocking again
-                        L1Framing.ExtractFrames(L1RxBuffer, data => CallAllEvents(data, delegate () { throw new NotImplementedException(); }), ErrorReported);
+                        L1Framing.ExtractFrames(L1RxBuffer, data => CallAllEvents(data), ErrorReported);
                     }
                     catch (Exception e) when (e is IOException or ObjectDisposedException or InvalidOperationException)
                     {
@@ -190,15 +194,20 @@ namespace ModemAPI
                     ErrorReported(new NullTransmitterException("udp"));
                     return;
                 }
+                // one buffer and one address for every datagram instead of a new array and endpoint for each: the handlers only look
+                // at the data during the call (LineDataHandler)
+                Socket socket = udp.Client;
+                byte[] buffer = new byte[ushort.MaxValue];
+                SocketAddress from = new(socket.AddressFamily);
                 while (true)
                 {
-                    byte[] datagram;
-                    IPEndPoint? ep = null;
+                    int length;
                     try
                     {
                         // one datagram is one whole packet: a lost, repeated or reordered datagram affects only itself
-                        datagram = udp.Receive(ref ep);
-                        ModemAPIDebugger.OutputDebugMessage($"low latency physical modem received a datagram from {ep}");
+                        from.Size = from.Buffer.Length;
+                        length = socket.ReceiveFrom(buffer, SocketFlags.None, from);
+                        ModemAPIDebugger.OutputDebugMessage($"low latency physical modem received a datagram from {from}");
                     }
                     catch (ObjectDisposedException)
                     {
@@ -216,17 +225,23 @@ namespace ModemAPI
                     // the one answered only by a valid connection request while there is no connection. A subscriber, that comes
                     // back from another port (a restart, or NAT gave it a new one), connects as soon as Modem-KeepAlive finds the old
                     // connection dead; from its own address and port it reconnects right away
-                    if (!ep!.Equals(UdpPeer))
+                    ReadOnlySpan<byte> datagram = buffer.AsSpan(0, length);
+                    if (!from.Equals(UdpPeer))
                     {
-                        if (!CanTakeNewSubscriber() || PacketConverter.ParseLowLatencyConnectionRequest(datagram).IsRequestDamaged)
+                        if (!CanTakeNewSubscriber()
+                            || !PacketConverter.MayBeConnectionRequest(datagram)
+                            || PacketConverter.ParseLowLatencyConnectionRequest(datagram.ToArray()).IsRequestDamaged)
                         {
                             continue;
                         }
-                        UdpPeer = ep;
+                        // a copy: the address of the reader is overwritten by the next datagram
+                        SocketAddress peer = new(from.Family, from.Size);
+                        from.Buffer.Span[..from.Size].CopyTo(peer.Buffer.Span);
+                        UdpPeer = peer;
                     }
                     try
                     {
-                        CallAllEvents(datagram, delegate () { throw new NotImplementedException(); });
+                        CallAllEvents(datagram);
                     }
                     catch (Exception e)
                     {
@@ -235,11 +250,20 @@ namespace ModemAPI
                 }
             }
 
-            private void CallAllEvents(byte[] a, Action b)
+            private void CallAllEvents(ReadOnlySpan<byte> data)
             {
-                foreach (Action<byte[], Action> action in readEvents.ToArray()) // handlers may be added while the reader thread is running
+                // handlers may be added while the reader thread is running: it goes through the array, that was current
+                foreach (LineDataHandler handler in Volatile.Read(ref readEvents))
                 {
-                    action(a, b);
+                    handler(data);
+                }
+            }
+
+            private void AddReadEvent(LineDataHandler handler)
+            {
+                lock (readEventsLock)
+                {
+                    readEvents = [.. readEvents, handler];
                 }
             }
 
@@ -291,8 +315,8 @@ namespace ModemAPI
                         throw new ArgumentOutOfRangeException(nameof(data), $"a packet sent over UDP must not be longer than {L1Framing.MaxDatagramLength} bytes");
                     }
                     // the whole packet is one datagram, without a length header: UDP keeps datagrams whole, and losing one loses only that packet
-                    IPEndPoint peer = UdpPeer ?? throw new NullTransmitterException("udp: nothing has come from the subscriber yet, so there is nowhere to answer");
-                    udp.Send(data, data.Length, peer);
+                    SocketAddress peer = UdpPeer ?? throw new NullTransmitterException("udp: nothing has come from the subscriber yet, so there is nowhere to answer");
+                    udp.Client.SendTo(data, SocketFlags.None, peer);
                 }
             }
             /// <summary>
@@ -356,8 +380,8 @@ namespace ModemAPI
                             {
                                 throw new ArgumentOutOfRangeException(nameof(packet), $"a packet sent over UDP must not be longer than {L1Framing.MaxDatagramLength} bytes");
                             }
-                            IPEndPoint peer = UdpPeer ?? throw new NullTransmitterException("udp: nothing has come from the subscriber yet, so there is nowhere to answer");
-                            udp.Send(bytes, peer);
+                            SocketAddress peer = UdpPeer ?? throw new NullTransmitterException("udp: nothing has come from the subscriber yet, so there is nowhere to answer");
+                            udp.Client.SendTo(bytes, SocketFlags.None, peer);
                         }
                     }
                 }
@@ -389,7 +413,7 @@ namespace ModemAPI
                 }
                 if (t == L1Types.L1_INET_TCP)
                 {
-                    readEvents.Add((d, k) => onSuccessfulRead(d)); // add event to the list of events
+                    AddReadEvent(onSuccessfulRead);
                     if (!subscribedForReadingFromTcp)
                     {
                         subscribedForReadingFromTcp = true;
@@ -398,7 +422,7 @@ namespace ModemAPI
                 }
                 if (t == L1Types.L1_INET_UDP)
                 {
-                    readEvents.Add((d, k) => onSuccessfulRead(d)); // add event to the list of events
+                    AddReadEvent(onSuccessfulRead);
                     if (!subscribedForReadingFromUdp)
                     {
                         subscribedForReadingFromUdp = true;
@@ -452,6 +476,9 @@ namespace ModemAPI
             {
                 // the answering side listens on its own address and port (like the TCP listener above), and answers whoever calls
                 UdpClient client = new(new IPEndPoint(IPAddress.Parse(wire.Split(':')[0]), int.Parse(wire.Split(':')[1])));
+                // the default buffers lose the datagrams of a burst (see UdpSocketBufferSize); here is the address machine's end
+                // of the line, and it has as many of them, as it has UDP lines
+                L1Framing.SetUdpSocketBuffers(client.Client);
                 if (OperatingSystem.IsWindows())
                 {
                     // without this an ICMP "port unreachable" for an earlier answer makes the next Receive throw
@@ -760,6 +787,7 @@ namespace ModemAPI
                 }
                 TransmissionQueue.Writer.WriteAsync(packet).AsTask().GetAwaiter().GetResult();
             }
+            TxWakeup.Notify();
             if (TxLoopWorking)
             {
                 return;
@@ -775,10 +803,13 @@ namespace ModemAPI
                 // instead of a thread pool one): a write error is reported and the next packet is sent anyway
                 new Thread(delegate ()
                 {
-                    while (TransmissionQueue.Reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult())
+                    Action<Exception> onError = ex => InternalErrorHappened(ex, ErrorEmitter.LowLatencyAnsweringPhysicalModem);
+                    while (true)
                     {
                         // everything queued by now goes out together; a write error is reported and the next packets are sent anyway
-                        Communicator.WriteQueued(TransmissionQueue.Reader, ex => InternalErrorHappened(ex, ErrorEmitter.LowLatencyAnsweringPhysicalModem));
+                        Communicator.WriteQueued(TransmissionQueue.Reader, onError);
+                        // the queue is never completed: the thread sleeps until the next packet
+                        TxWakeup.Wait(TransmissionQueue.Reader);
                     }
                 })
                 { IsBackground = true, Name = "LowLatencyAnsweringPhysicalModem sender" }.Start();

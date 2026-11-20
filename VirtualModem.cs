@@ -18,6 +18,15 @@ namespace ModemAPI
         private string DownloadLargeMessagesFrom = "";
         private string DeleteLargeMessages = "";
         private SocketIO? TransmitterDevice = null;
+        // Socket.IO: one emit at a time, as RAWWS sends under RawSendLock. Several threads transmit at once (an application, SRTP
+        // retransmissions and acknowledgements), and it isn't known, whether the Socket.IO client takes emits from several threads:
+        // a ClientWebSocket under it refuses a second SendAsync, while one is in progress. Held until the emit itself ends, not
+        // until its caller stops waiting, so two emits never overlap
+        private readonly SemaphoreSlim SocketIOSendLock = new(1, 1);
+        // Socket.IO: how long a transmission waits for its turn and for its emit. The Socket.IO client can't be aborted from here
+        // as a RAWWS socket is; it drops a connection, that doesn't take data, itself (no pings from the server), and that ends the
+        // stuck emit. Meanwhile the senders of this modem give up after this time instead of waiting forever
+        internal TimeSpan SocketIOSendTimeout = TimeSpan.FromSeconds(15);
         private ClientWebSocket? RawTransmitterDevice = null;
         // RAWWS: a WebSocket takes one send at a time, and the message of a packet is written into a buffer reused under this lock
         private readonly SemaphoreSlim RawSendLock = new(1, 1);
@@ -494,7 +503,7 @@ namespace ModemAPI
                 }
                 TransmitterDevice.On("get-addr", async delegate (IEventContext context)
                 {
-                    await TransmitterDevice.EmitAsync("self-addr", [localModemAddressString]);
+                    await EmitSerializedAsync("self-addr", localModemAddressString);
                     return;
                 });
                 TransmitterDevice.On("set-modem-local-address", delegate (IEventContext dto)
@@ -516,7 +525,7 @@ namespace ModemAPI
                 });
                 TransmitterDevice.On("get-device-type", async delegate (IEventContext dto)
                 {
-                    await TransmitterDevice.EmitAsync("device-type", [ConnectAsAnAddressMachine ? "address-machine" : "modem"]);
+                    await EmitSerializedAsync("device-type", ConnectAsAnAddressMachine ? "address-machine" : "modem");
                     InternalModemConnected = true;
                     return;
                 });
@@ -741,6 +750,44 @@ namespace ModemAPI
         private static bool IsWithin(string address, string local)
         {
             return address.StartsWith(local, StringComparison.Ordinal) && (address.Length == local.Length || address[local.Length] == '-');
+        }
+
+        /// <summary>
+        /// Socket.IO: emits an event with one value in turn with the other emits of this modem.
+        /// </summary>
+        private async Task EmitSerializedAsync(string eventName, object value)
+        {
+            if (!await SocketIOSendLock.WaitAsync(SocketIOSendTimeout))
+            {
+                throw new TimeoutException($"the previous Socket.IO emit hasn't ended for {SocketIOSendTimeout}: {eventName} isn't sent");
+            }
+            await StartSerializedEmit(eventName, value).WaitAsync(SocketIOSendTimeout);
+        }
+
+        /// <summary>
+        /// Socket.IO: starts an emit, once <see cref="SocketIOSendLock"/> is taken; the lock is released, when the emit ends.
+        /// </summary>
+        private Task StartSerializedEmit(string eventName, object value)
+        {
+            Task emit;
+            try
+            {
+                emit = TransmitterDevice!.EmitAsync(eventName, [value]);
+            }
+            catch
+            {
+                SocketIOSendLock.Release();
+                throw;
+            }
+            if (emit.IsCompleted)
+            {
+                SocketIOSendLock.Release();
+            }
+            else
+            {
+                emit.ContinueWith(static (_, sendLock) => ((SemaphoreSlim)sendLock!).Release(), SocketIOSendLock, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            }
+            return emit;
         }
 
         private async Task RawSendAsync(byte[] message)
@@ -974,7 +1021,18 @@ namespace ModemAPI
                 {
                     throw new InvalidOperationException("transmitter device null");
                 }
-                TransmitterDevice.EmitAsync("data-transmission", [PacketConverter.PacketToWebSocketMessage(packet)]).Wait();
+                // converted before the lock is taken: a packet, that can't be converted, must not keep it
+                WebSocketMessage message = PacketConverter.PacketToWebSocketMessage(packet);
+                if (!SocketIOSendLock.Wait(SocketIOSendTimeout))
+                {
+                    throw new TimeoutException($"the previous Socket.IO emit hasn't ended for {SocketIOSendTimeout}: the packet isn't sent");
+                }
+                Task emit = StartSerializedEmit("data-transmission", message);
+                // an error of the emit comes as an AggregateException, as it did before
+                if (!emit.Wait(SocketIOSendTimeout))
+                {
+                    throw new TimeoutException($"the Socket.IO emit hasn't ended for {SocketIOSendTimeout}: the packet may be sent later, or lost");
+                }
             }
             else
             {

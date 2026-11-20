@@ -35,6 +35,7 @@ namespace ModemAPI
                 SingleWriter = false
             });
         private volatile bool TxLoopWorking = false;
+        private readonly SenderWakeup TxWakeup = new();
         private long LocallyDroppedPackets = 0;
         private readonly SubscriberList<Packet> PacketSubscribers = new();
         private readonly SubscriberList<DataBlock> DataBlockSubscribers = new();
@@ -116,7 +117,9 @@ namespace ModemAPI
             public ISerialPacket? sp = sp;
             private bool subscribedForReadingFromTcp = false;
             private bool subscribedForReadingFromUdp = false;
-            List<Action<byte[], Action>> readEvents = [];
+            // copied on every change, so the reader thread goes through it without a lock or a copy for every datagram
+            private LineDataHandler[] readEvents = [];
+            private readonly Lock readEventsLock = new();
             private bool isInitialized = false;
             private L1Types t;
             private List<byte> L1RxBuffer = [];
@@ -151,7 +154,7 @@ namespace ModemAPI
                         ModemAPIDebugger.OutputDebugMessage($"low latency physical modem received data from tcp");
                         L1RxBuffer.AddRange(buffer.AsSpan(0, read));
                         // one read may carry several frames, all of them must be handled before blocking again
-                        L1Framing.ExtractFrames(L1RxBuffer, data => CallAllEvents(data, delegate () { throw new NotImplementedException(); }), ErrorReported);
+                        L1Framing.ExtractFrames(L1RxBuffer, data => CallAllEvents(data), ErrorReported);
                     }
                     catch (ObjectDisposedException)
                     {
@@ -171,15 +174,18 @@ namespace ModemAPI
                     ErrorReported(new NullTransmitterException("udp"));
                     return;
                 }
+                // one buffer for every datagram instead of a new array and endpoint for each: the handlers only look at the data
+                // during the call (LineDataHandler). The socket is connected, so only the answering modem's datagrams come
+                Socket socket = udp.Client;
+                byte[] buffer = new byte[ushort.MaxValue];
                 while (true)
                 {
-                    byte[] datagram;
+                    int length;
                     try
                     {
-                        IPEndPoint? ep = null;
                         // one datagram is one whole packet: a lost, repeated or reordered datagram affects only itself
-                        datagram = udp.Receive(ref ep);
-                        ModemAPIDebugger.OutputDebugMessage($"low latency physical modem received a datagram from {ep}");
+                        length = socket.Receive(buffer);
+                        ModemAPIDebugger.OutputDebugMessage($"low latency physical modem received a datagram of {length} bytes");
                     }
                     catch (ObjectDisposedException)
                     {
@@ -194,7 +200,7 @@ namespace ModemAPI
                     }
                     try
                     {
-                        CallAllEvents(datagram, delegate () { throw new NotImplementedException(); });
+                        CallAllEvents(buffer.AsSpan(0, length));
                     }
                     catch (Exception e)
                     {
@@ -203,11 +209,20 @@ namespace ModemAPI
                 }
             }
 
-            private void CallAllEvents(byte[] a, Action b)
+            private void CallAllEvents(ReadOnlySpan<byte> data)
             {
-                foreach (Action<byte[], Action> action in readEvents.ToArray()) // handlers may be added while the reader thread is running
+                // handlers may be added while the reader thread is running: it goes through the array, that was current
+                foreach (LineDataHandler handler in Volatile.Read(ref readEvents))
                 {
-                    action(a, b);
+                    handler(data);
+                }
+            }
+
+            private void AddReadEvent(LineDataHandler handler)
+            {
+                lock (readEventsLock)
+                {
+                    readEvents = [.. readEvents, handler];
                 }
             }
 
@@ -353,7 +368,7 @@ namespace ModemAPI
                 }
                 if (t == L1Types.L1_INET_TCP)
                 {
-                    readEvents.Add((d, k) => onSuccessfulRead(d)); // add event to the list of events
+                    AddReadEvent(onSuccessfulRead);
                     if (!subscribedForReadingFromTcp)
                     {
                         subscribedForReadingFromTcp = true;
@@ -362,7 +377,7 @@ namespace ModemAPI
                 }
                 if (t == L1Types.L1_INET_UDP)
                 {
-                    readEvents.Add((d, k) => onSuccessfulRead(d)); // add event to the list of events
+                    AddReadEvent(onSuccessfulRead);
                     if (!subscribedForReadingFromUdp)
                     {
                         subscribedForReadingFromUdp = true;
@@ -414,6 +429,7 @@ namespace ModemAPI
             else if (wt == L1Types.L1_INET_UDP)
             {
                 UdpClient client = new();
+                L1Framing.SetUdpSocketBuffers(client.Client);
                 client.Connect(IPAddress.Parse(wire.Split(':')[0]), int.Parse(wire.Split(':')[1]));
                 Communicator = new(null, client, null);
             }
@@ -483,6 +499,8 @@ namespace ModemAPI
             else if (wt == L1Types.L1_INET_UDP)
             {
                 UdpClient client = new();
+                // the default buffers lose the datagrams of a burst (see UdpSocketBufferSize)
+                L1Framing.SetUdpSocketBuffers(client.Client);
                 client.Connect(IPAddress.Parse(wire.Split(':')[0]), int.Parse(wire.Split(':')[1]));
                 Communicator = new(null, client, null);
             }
@@ -812,6 +830,7 @@ namespace ModemAPI
                 }
                 TransmissionQueue.Writer.WriteAsync(packet).AsTask().GetAwaiter().GetResult();
             }
+            TxWakeup.Notify();
             if (TxLoopWorking)
             {
                 return;
@@ -827,10 +846,13 @@ namespace ModemAPI
                 // instead of a thread pool one): a write error is reported and the next packet is sent anyway
                 new Thread(delegate ()
                 {
-                    while (TransmissionQueue.Reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult())
+                    Action<Exception> onError = ex => InternalErrorHappened(ex, ErrorEmitter.LowLatencyPhysicalModem);
+                    while (true)
                     {
                         // everything queued by now goes out together; a write error is reported and the next packets are sent anyway
-                        Communicator.WriteQueued(TransmissionQueue.Reader, ex => InternalErrorHappened(ex, ErrorEmitter.LowLatencyPhysicalModem));
+                        Communicator.WriteQueued(TransmissionQueue.Reader, onError);
+                        // the queue is never completed: the thread sleeps until the next packet
+                        TxWakeup.Wait(TransmissionQueue.Reader);
                     }
                 })
                 { IsBackground = true, Name = "LowLatencyPhysicalModem sender" }.Start();
