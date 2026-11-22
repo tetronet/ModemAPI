@@ -422,3 +422,72 @@ A UNAME is answered by the first one, that matches:
 * Delivery isn't guaranteed and nothing is retransmitted: a lost request or response ends in a timeout of the client
 * Without encryption UNNRP has no protection at all: anyone on the route can read or change the answers
 ```
+### SFDP, aka System For Data Protocol
+Sends structured data to a remote system and brings back its answer. Every exchange is one request and one response, both of them
+ordinary tetronet messages (fragmented, if they don't fit into one packet), sent with query type "sfd_object" and a ConnectionID
+from the range the server listens to (chosen by the user). The response has the ConnectionID of the request.
+There are no sessions, every request is independent, and the protocol has no standard fields: all of them are defined by the user.
+
+##### Exchange
+The metadata and the encryption are exactly the same as in NCCP (see there), only the beginnings of the AAD differ:
+```
++---------------------------------------------------------------------------------------------+
+| request                                                                                     |
+| metadata: "q:<request ID>"                    without encryption                            |
+|           "qe:<nonce>:<time>:<tag>"           AES-256-GCM                                   |
+| data:     the message in UTF-8 (encrypted: the ciphertext of it, exactly as long)           |
++---------------------------------------------------------------------------------------------+
+                                              |
+                                              V
++---------------------------------------------------------------------------------------------+
+| response                                                                                    |
+| metadata: "r:<request ID>"                    without encryption                            |
+|           "re:<request nonce>:<nonce>:<tag>"  AES-256-GCM                                   |
+| data:     the message in UTF-8 (encrypted: the ciphertext of it, exactly as long)           |
++---------------------------------------------------------------------------------------------+
+AAD: request "sfdp-q|<client address>|<server address>|<time>", response "sfdp-r|<client address>|<server address>|<request nonce>"
+```
+##### Message
+```
+      SFD_DATA_TRANSFER        <- the header: 6 spaces (0x20) and the name, the whole first line
+Key: value                     <- the body, after one line break; only SFD_DATA_TRANSFER and SFD_DATA_RESPONSE have one
+
+request              response
+      SFD_PING       ->       SFD_PONG
+      SFD_DATA_TRANSFER ->    SFD_DATA_RESPONSE (and the body) or       SFD_NO_DATA (no data to answer with)
+* Line breaks: CRLF, LFCR, CR and LF are all taken (CR and LF next to each other are one break). LF is what is sent.
+  The header ends at the first line break, the body is everything after that break, as it is
+* A header without the 6 spaces, with other characters around it, or with another name makes the message invalid, it's dropped
+* SFD_PING is always sent without encryption and is answered also by a server, that uses encryption
+* The server answers every accepted SFD_DATA_TRANSFER, also when it failed to handle it: then with SFD_NO_DATA
+* The body isn't checked by the protocol: a client can send any text, and the server gets it as is
+```
+##### Body
+```
+ObjectKey: objectValue
+DictionaryThing:
+--ObjectKey: 47
+--AnotherObjectKey: "this string contains spaces so it must be in quotes"
+--DictionaryInside:
+----Lol: kek
+--ThisBelongsToDictionaryThing: sure_it_does_tbh
+ThisIsOnTheRootLevel: yup
+* One field per line, lines are separated by any line break (see Message); empty lines are ignored
+* "<name>: <value>" - a string field: the name, ':', exactly one space, the value
+* "<name>:"         - a nested object (nothing after ':'): the following lines with one more "--" in front belong to it
+* "--" in front of the line, once for every level of nesting; a line can be nested at most one level deeper than the line before
+  it, and only after a line, that opens an object. An object without lines in it is empty
+* A name is not empty, doesn't start with '-' and has no whitespaces, control characters, ':' or '"' in it. Names are
+  case-sensitive, a name can be only once in one object
+* A value without quotes has no whitespaces, control characters or '"' in it and is not empty
+* Any other value is written in quotes: "..."; in them \" is ", \\ is \, \n is LF and \r is CR, any other character after \ is an error,
+  other characters (also \ outside of quotes) are taken as they are. Nothing may follow the closing quote
+* There are no types: every value is a string. There are no lists
+* Objects are nested at most 64 levels deep
+```
+##### Delivery
+```
+* Delivery isn't guaranteed and nothing is retransmitted: a lost request or response ends in a timeout of the client.
+  Data, that has to be delivered, is sent with LMDTP
+* A timeout doesn't tell, whether the server got the data: maybe only the response was lost
+```
