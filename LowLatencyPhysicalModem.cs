@@ -177,6 +177,11 @@ namespace ModemAPI
                 // one buffer for every datagram instead of a new array and endpoint for each: the handlers only look at the data
                 // during the call (LineDataHandler). The socket is connected, so only the answering modem's datagrams come
                 Socket socket = udp.Client;
+                if (UdpBatch.IsSupported)
+                {
+                    UdpBatchReader(socket);
+                    return;
+                }
                 byte[] buffer = new byte[ushort.MaxValue];
                 while (true)
                 {
@@ -205,6 +210,48 @@ namespace ModemAPI
                     catch (Exception e)
                     {
                         ErrorReported(e);
+                    }
+                }
+            }
+
+            /// <summary>
+            /// <see cref="UdpReader"/> with recvmmsg: every datagram, that has come by now, with one system call.
+            /// </summary>
+            private void UdpBatchReader(Socket socket)
+            {
+                UdpBatch.Receiver receiver = new(withSources: false);
+                while (true)
+                {
+                    int count;
+                    try
+                    {
+                        count = receiver.Receive(socket);
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        return;
+                    }
+                    catch (Exception e)
+                    {
+                        // for example ICMP "port unreachable" of an earlier datagram; the socket still works
+                        ErrorReported(e);
+                        continue;
+                    }
+                    if (count == 0)
+                    {
+                        // recvmmsg doesn't return 0 for a nonzero count; if it ever does, nothing more can come
+                        return;
+                    }
+                    for (int i = 0; i < count; i++)
+                    {
+                        try
+                        {
+                            CallAllEvents(receiver.Datagram(i));
+                        }
+                        catch (Exception e)
+                        {
+                            ErrorReported(e);
+                        }
                     }
                 }
             }
@@ -291,6 +338,11 @@ namespace ModemAPI
                     }, onError);
                     return;
                 }
+                if (t == L1Types.L1_INET_UDP && UdpBatch.IsSupported)
+                {
+                    WriteQueuedUdp(queue, onError);
+                    return;
+                }
                 while (queue.TryRead(out Packet? packet))
                 {
                     try
@@ -303,6 +355,72 @@ namespace ModemAPI
                     }
                 }
             }
+
+            // the sender thread's datagrams, sent with sendmmsg
+            private UdpBatch.Sender? UdpSender;
+
+            /// <summary>
+            /// <see cref="WriteQueued"/> over UDP with sendmmsg: the queued packets are converted one after another into one buffer
+            /// and go out with as few system calls as possible, every packet still a datagram of its own.
+            /// </summary>
+            private void WriteQueuedUdp(ChannelReader<Packet> queue, Action<Exception> onError)
+            {
+                if (udp == null)
+                {
+                    onError(new NullTransmitterException("udp"));
+                    return;
+                }
+                UdpBatch.Sender sender = UdpSender ??= new();
+                while (queue.TryRead(out Packet? packet))
+                {
+                    try
+                    {
+                        int size = PacketConverter.EstimatePacketSize(packet);
+                        if (size > L1Framing.MaxDatagramLength)
+                        {
+                            throw new ArgumentOutOfRangeException(nameof(packet), $"a packet sent over UDP must not be longer than {L1Framing.MaxDatagramLength} bytes");
+                        }
+                        Span<byte> room = sender.Reserve(size);
+                        if (room.IsEmpty)
+                        {
+                            SendCollected(sender, onError);
+                            room = sender.Reserve(size);
+                        }
+                        PacketConverter.PacketToBytes(packet, room);
+                        sender.Commit(size);
+                    }
+                    catch (Exception e)
+                    {
+                        onError(e);
+                    }
+                }
+                SendCollected(sender, onError);
+            }
+
+            private void SendCollected(UdpBatch.Sender sender, Action<Exception> onError)
+            {
+                if (sender.IsEmpty || udp == null)
+                {
+                    return;
+                }
+                try
+                {
+                    lock (_writeLock)
+                    {
+                        sender.Send(udp.Client, null, onError);
+                    }
+                }
+                catch (Exception e)
+                {
+                    onError(e);
+                }
+                finally
+                {
+                    // datagrams, that couldn't be sent, are lost, as they would have been one by one
+                    sender.Clear();
+                }
+            }
+
             /// <summary>
             /// Sends a packet, converted straight into a pooled buffer instead of an array of its own.
             /// </summary>
@@ -755,17 +873,8 @@ namespace ModemAPI
             {
                 throw new NullAddressException();
             }
-            Packet packet = new();
-            packet.PacketNo = 0;
-            packet.MessageId = (ulong)Random.Shared.NextInt64();
-            packet.Transmitter = LocalModemAddress;
-            packet.QueryType = qt;
-            packet.Receiver = address;
-            packet.ConnectionID = cid;
-            packet.Metadata = metadata;
-            packet.DataBytes = data;
-            packet.IsLastInSequence = true;
-            packet.RoutersToPass = ttl;
+            // the full constructor: new Packet() makes two addresses of its own, that would be thrown away right here
+            Packet packet = new(LocalModemAddress, address, data, true, metadata, qt, cid, false, 0, (ulong)Random.Shared.NextInt64(), ttl);
             Transmit(packet);
         }
 

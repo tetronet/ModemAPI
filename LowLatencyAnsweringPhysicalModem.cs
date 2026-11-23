@@ -197,8 +197,13 @@ namespace ModemAPI
                 // one buffer and one address for every datagram instead of a new array and endpoint for each: the handlers only look
                 // at the data during the call (LineDataHandler)
                 Socket socket = udp.Client;
-                byte[] buffer = new byte[ushort.MaxValue];
                 SocketAddress from = new(socket.AddressFamily);
+                if (UdpBatch.IsSupported)
+                {
+                    UdpBatchReader(socket, from);
+                    return;
+                }
+                byte[] buffer = new byte[ushort.MaxValue];
                 while (true)
                 {
                     int length;
@@ -220,33 +225,76 @@ namespace ModemAPI
                         ErrorReported(e);
                         continue;
                     }
-                    // the line belongs to one subscriber: anybody can send a datagram to this port (with any source address, the same
-                    // IP address as the subscriber's too: it can be forged, or be a NAT shared by many), so another address becomes
-                    // the one answered only by a valid connection request while there is no connection. A subscriber, that comes
-                    // back from another port (a restart, or NAT gave it a new one), connects as soon as Modem-KeepAlive finds the old
-                    // connection dead; from its own address and port it reconnects right away
-                    ReadOnlySpan<byte> datagram = buffer.AsSpan(0, length);
-                    if (!from.Equals(UdpPeer))
-                    {
-                        if (!CanTakeNewSubscriber()
-                            || !PacketConverter.MayBeConnectionRequest(datagram)
-                            || PacketConverter.ParseLowLatencyConnectionRequest(datagram.ToArray()).IsRequestDamaged)
-                        {
-                            continue;
-                        }
-                        // a copy: the address of the reader is overwritten by the next datagram
-                        SocketAddress peer = new(from.Family, from.Size);
-                        from.Buffer.Span[..from.Size].CopyTo(peer.Buffer.Span);
-                        UdpPeer = peer;
-                    }
+                    OnDatagram(buffer.AsSpan(0, length), from);
+                }
+            }
+
+            /// <summary>
+            /// <see cref="UdpReader"/> with recvmmsg: every datagram, that has come by now, with one system call.
+            /// </summary>
+            private void UdpBatchReader(Socket socket, SocketAddress from)
+            {
+                UdpBatch.Receiver receiver = new(withSources: true);
+                while (true)
+                {
+                    int count;
                     try
                     {
-                        CallAllEvents(datagram);
+                        count = receiver.Receive(socket);
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        return;
                     }
                     catch (Exception e)
                     {
+                        // for example ICMP "port unreachable" of an earlier datagram; the socket still works
                         ErrorReported(e);
+                        continue;
                     }
+                    if (count == 0)
+                    {
+                        // recvmmsg doesn't return 0 for a nonzero count; if it ever does, nothing more can come
+                        return;
+                    }
+                    for (int i = 0; i < count; i++)
+                    {
+                        receiver.CopySource(i, from);
+                        OnDatagram(receiver.Datagram(i), from);
+                    }
+                }
+            }
+
+            /// <summary>
+            /// Handles a datagram of the line; <paramref name="from"/> is overwritten by the next one.
+            /// </summary>
+            private void OnDatagram(ReadOnlySpan<byte> datagram, SocketAddress from)
+            {
+                // the line belongs to one subscriber: anybody can send a datagram to this port (with any source address, the same
+                // IP address as the subscriber's too: it can be forged, or be a NAT shared by many), so another address becomes
+                // the one answered only by a valid connection request while there is no connection. A subscriber, that comes
+                // back from another port (a restart, or NAT gave it a new one), connects as soon as Modem-KeepAlive finds the old
+                // connection dead; from its own address and port it reconnects right away
+                if (!from.Equals(UdpPeer))
+                {
+                    if (!CanTakeNewSubscriber()
+                        || !PacketConverter.MayBeConnectionRequest(datagram)
+                        || PacketConverter.ParseLowLatencyConnectionRequest(datagram.ToArray()).IsRequestDamaged)
+                    {
+                        return;
+                    }
+                    // a copy: the address of the reader is overwritten by the next datagram
+                    SocketAddress peer = new(from.Family, from.Size);
+                    from.Buffer.Span[..from.Size].CopyTo(peer.Buffer.Span);
+                    UdpPeer = peer;
+                }
+                try
+                {
+                    CallAllEvents(datagram);
+                }
+                catch (Exception e)
+                {
+                    ErrorReported(e);
                 }
             }
 
@@ -335,6 +383,11 @@ namespace ModemAPI
                     }, onError);
                     return;
                 }
+                if (t == L1Types.L1_INET_UDP && UdpBatch.IsSupported)
+                {
+                    WriteQueuedUdp(queue, onError);
+                    return;
+                }
                 while (queue.TryRead(out Packet? packet))
                 {
                     try
@@ -347,6 +400,74 @@ namespace ModemAPI
                     }
                 }
             }
+
+            // the sender thread's datagrams, sent with sendmmsg
+            private UdpBatch.Sender? UdpSender;
+
+            /// <summary>
+            /// <see cref="WriteQueued"/> over UDP with sendmmsg: the queued packets are converted one after another into one buffer
+            /// and go out with as few system calls as possible, every packet still a datagram of its own.
+            /// </summary>
+            private void WriteQueuedUdp(ChannelReader<Packet> queue, Action<Exception> onError)
+            {
+                if (udp == null)
+                {
+                    onError(new NullTransmitterException("udp"));
+                    return;
+                }
+                UdpBatch.Sender sender = UdpSender ??= new();
+                while (queue.TryRead(out Packet? packet))
+                {
+                    try
+                    {
+                        int size = PacketConverter.EstimatePacketSize(packet);
+                        if (size > L1Framing.MaxDatagramLength)
+                        {
+                            throw new ArgumentOutOfRangeException(nameof(packet), $"a packet sent over UDP must not be longer than {L1Framing.MaxDatagramLength} bytes");
+                        }
+                        Span<byte> room = sender.Reserve(size);
+                        if (room.IsEmpty)
+                        {
+                            SendCollected(sender, onError);
+                            room = sender.Reserve(size);
+                        }
+                        PacketConverter.PacketToBytes(packet, room);
+                        sender.Commit(size);
+                    }
+                    catch (Exception e)
+                    {
+                        onError(e);
+                    }
+                }
+                SendCollected(sender, onError);
+            }
+
+            private void SendCollected(UdpBatch.Sender sender, Action<Exception> onError)
+            {
+                if (sender.IsEmpty || udp == null)
+                {
+                    return;
+                }
+                try
+                {
+                    // read once: every collected datagram goes to the same subscriber
+                    SocketAddress peer = UdpPeer ?? throw new NullTransmitterException("udp: nothing has come from the subscriber yet, so there is nowhere to answer");
+                    lock (WriteLock)
+                    {
+                        sender.Send(udp.Client, peer, onError);
+                    }
+                }
+                catch (Exception e)
+                {
+                    onError(e);
+                }
+                finally
+                {
+                    // datagrams, that couldn't be sent, are lost, as they would have been one by one
+                    sender.Clear();
+                }
+            }
+
             /// <summary>
             /// Sends a packet, converted straight into a pooled buffer instead of an array of its own.
             /// </summary>

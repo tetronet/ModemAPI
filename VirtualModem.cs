@@ -1084,17 +1084,8 @@ namespace ModemAPI
             {
                 throw new NullAddressException();
             }
-            Packet packet = new();
-            packet.PacketNo = 0;
-            packet.MessageId = (ulong)Random.Shared.NextInt64();
-            packet.Transmitter = LocalModemAddress;
-            packet.QueryType = qt;
-            packet.Receiver = address;
-            packet.ConnectionID = cid;
-            packet.Metadata = metadata;
-            packet.DataBytes = data;
-            packet.IsLastInSequence = true;
-            packet.RoutersToPass = ttl;
+            // the full constructor: new Packet() makes two addresses of its own, that would be thrown away right here
+            Packet packet = new(LocalModemAddress, address, data, true, metadata, qt, cid, false, 0, (ulong)Random.Shared.NextInt64(), ttl);
             Transmit(packet);
         }
         /// <summary>

@@ -106,7 +106,7 @@ namespace ModemAPI
             {
                 return Errored(PacketReadError.NotAPacket);
             }
-            if (Crc32.HashToUInt32(bytes[..^4]) != BinaryPrimitives.ReadUInt32LittleEndian(bytes[^4..]))
+            if (PacketCrc.HashToUInt32(bytes[..^4]) != BinaryPrimitives.ReadUInt32LittleEndian(bytes[^4..]))
             {
                 return Errored(PacketReadError.CrcMismatch);
             }
@@ -309,7 +309,7 @@ namespace ModemAPI
             BinaryPrimitives.WriteUInt16BigEndian(destination[offset..], (ushort)metadataLength);
             offset += 2 + metadataLength;
             // CRC, in the same byte order as Crc32.Hash() produces it
-            BinaryPrimitives.WriteUInt32LittleEndian(destination[offset..], Crc32.HashToUInt32(destination[..offset]));
+            BinaryPrimitives.WriteUInt32LittleEndian(destination[offset..], PacketCrc.HashToUInt32(destination[..offset]));
         }
 
         /// <summary>
